@@ -532,8 +532,8 @@ class KalshiTradingAPI(AbstractTradingAPI):
     def login(self):
         self.logger.info("Logging in...")
         config = Configuration(
-            username=os.env("KALSHI_EMAIL"),
-            password=os.env("KALSHI_PASSWORD"),
+            username=os.getenv("KALSHI_EMAIL"),
+            password=os.getenv("KALSHI_PASSWORD"),
             access_token=os.getenv("KALSHI_API_KEY_ID"),
         )
         with open(os.getenv("KALSHI_PRIVATE_KEY_PATH"), "r") as f:
