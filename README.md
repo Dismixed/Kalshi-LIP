@@ -1,21 +1,22 @@
-# Kalshi Market Making Algorithm
+# Kalshi LIP Bot
 
-This project implements a market making algorithm for Kalshi markets, capable of running multiple strategies in parallel. Its most involved algorithm implementaiton is the Avellaneda-Stoikov model.
+This project implements a LIP (Liquidity Improvement Program) bot for Kalshi markets. It provides a configurable LIP quoting loop with risk controls and logging. The current runner executes a single strategy per process using the configuration in `config.yaml`.
 
 ## Local Setup
 
 1. Clone the repository
-2. Install dependencies:
+2. (Recommended) Use Python 3.11 and a virtualenv, then install dependencies:
    ```
+   python -m venv venv
+   source venv/bin/activate
    pip install -r requirements.txt
    ```
 3. Create a `.env` file with your Kalshi credentials:
    ```
    KALSHI_EMAIL=your_email
    KALSHI_PASSWORD=your_password
-   KALSHI_BASE_URL=https://trading-api.kalshi.com/trade-api/v2
    ```
-4. Create or modify the `config.yaml` file with your market making configurations. Each configuration in this file will run as a separate strategy.
+4. Create or modify the `config.yaml` file with your LIP bot configuration (see below).
 5. Run the script:
    ```
    python runner.py --config config.yaml
@@ -23,37 +24,41 @@ This project implements a market making algorithm for Kalshi markets, capable of
 
 ## Configuration
 
-The `config.yaml` file should contain one or more strategy configurations. Each strategy should have a unique name and include the following sections:
+The `config.yaml` file defines a single strategy. Key sections:
 
-- `api`: Specifies the market ticker and trade side.
-- `market_maker`: Defines parameters for the Avellaneda market maker algorithm.
-- `dt`: The time step for the market maker's main loop.
+- `api`: Parameters related to data selection. Leave empty to auto-scan liquid markets.
+- `market_maker`: Core LIP quoting and risk parameters (section name retained as `market_maker`).
+- `circuit_breaker`: Safety limits to stop the bot under adverse conditions.
+- `dt`: Time step (seconds) for the bot's main loop.
+- `log_level`: `DEBUG|INFO|WARN|ERROR`.
 
 Example:
 
 ```yaml
-strategy_name:
-  api:
-    market_ticker: MARKET-TICKER
-    trade_side: "yes"
-  market_maker:
-    max_position: 5
-    order_expiration: 28800
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 28800
-    min_spread: 0.0
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
-  dt: 2.0
+api:
+  # no specific market; the bot will scan liquid markets
+market_maker:
+  max_position: 100                 # inventory cap
+  position_limit_buffer: 0.2        # start leaning before the cap
+  inventory_skew_factor: 0.01       # tilt quotes as inventory grows
+  improve_once_per_touch: true      # one nudge per external touch change
+  improve_cooldown_seconds: 0       # cooldown between nudges (0 disables)
+  min_quote_width_cents: 0          # optional spread floor in cents
+
+circuit_breaker:
+  max_consecutive_errors: 10        # trip after N consecutive API errors
+  pnl_threshold: -100.0             # stop if PnL drops below this ($)
+  max_inventory_imbalance: 0.9      # stop if inventory > 90% of max
+
+dt: 1.0                              # main loop refresh
+log_level: INFO
 ```
 
-You can define multiple strategies in the same file. The runner will execute all strategies in parallel.
+Note: The current `runner.py` executes one strategy per run. To run multiple strategies, start multiple processes (each with its own config or environment) or orchestrate separate deployments.
 
 ## Deploying on fly.io
 
-1. Install the flyctl CLI: https://fly.io/docs/hands-on/install-flyctl/
+1. Install the flyctl CLI: [Install flyctl](https://fly.io/docs/hands-on/install-flyctl/)
 2. Login to fly.io:
    ```
    flyctl auth login
@@ -63,11 +68,10 @@ You can define multiple strategies in the same file. The runner will execute all
    flyctl launch
    ```
    Follow the prompts, but don't deploy yet.
-4. Set your Kalshi credentials and base URL as secrets:
+4. Set your Kalshi credentials as secrets:
    ```
    flyctl secrets set KALSHI_EMAIL=your_email
    flyctl secrets set KALSHI_PASSWORD=your_password
-   flyctl secrets set KALSHI_BASE_URL=https://trading-api.kalshi.com/trade-api/v2
    ```
 5. Ensure your `config.yaml` file is in the project directory and contains all the strategies you want to run.
 6. Deploy the app:
@@ -75,14 +79,32 @@ You can define multiple strategies in the same file. The runner will execute all
    flyctl deploy
    ```
 
-The deployment will use the `runner.py` script, which will run all strategies defined in your `config.yaml` file in parallel.
+The deployment runs `runner.py` using your `config.yaml`.
 
 ## Monitoring
 
-Each strategy will log its activities to a separate log file named after the strategy (e.g., `strategy_name.log`). You can monitor these logs using the fly.io logging system:
+The bot logs to a file named after the config (e.g., `DEFAULT.log`) and also to stdout. You can monitor app logs via fly.io:
 
 ```
 flyctl logs
 ```
 
-For more detailed instructions on monitoring and managing your deployment, refer to the fly.io documentation.
+For more details on monitoring and alerting, see `MONITORING_QUICKSTART.md`.
+
+## Outputs
+
+During runtime and shutdown, the bot exports metrics and traces to CSV/JSON files in the project directory. Filenames are prefixed with the strategy identifier, for example:
+
+- `Strategy_DEFAULT_actions.csv`
+- `Strategy_DEFAULT_latencies.csv`
+- `Strategy_DEFAULT_loops.csv`
+- `Strategy_DEFAULT_metrics.json`
+- `DEFAULT_circuit_breaker_status.json`
+
+## Testing
+
+Run the test suite with:
+
+```
+pytest
+```

@@ -1,13 +1,18 @@
-KXMAYORNYCPARTY-25-AC:
-  api:
-    market_ticker: KXMAYORNYCPARTY-25-AC
-  market_maker:
-    max_position: 8                 # small but less constraining than 5
-    order_expiration: 300            # seconds; cancel/replace every cycle anyway
-    gamma: 0.001                     # a bit more risk-averse for jumpy binary
-    k: 200.0                   # deeper book -> smaller ln(1+γ/k) term
-    T: 28800                        # 8 hours
-    min_spread: 0.01                # at least one tick
-    position_limit_buffer: 0.2      # start leaning before the cliff
-    inventory_skew_factor: 0.01     # noticeably tilt quotes as q grows
-  dt: 1.0                            # faster refresh; 2s is fine if API limits
+api:
+  # no specific market; the bot will scan liquid markets
+market_maker:
+  max_position: 100                 # small but less constraining than 5
+  position_limit_buffer: 0.2      # start leaning before the cliff
+  inventory_skew_factor: 0.01     # noticeably tilt quotes as q grows
+  improve_once_per_touch: true     # only one 1-tick nudge per external touch change
+  improve_cooldown_seconds: 0      # optional cooldown between nudges (0 disables)
+  min_quote_width_cents: 0         # optional spread floor in cents (0 keeps current behavior)
+
+# Circuit breaker configuration
+circuit_breaker:
+  max_consecutive_errors: 10       # Trip circuit after N consecutive API errors
+  pnl_threshold: -100.0            # Trip circuit if PnL drops below this (in dollars)
+  max_inventory_imbalance: 0.9     # Trip circuit if inventory > 80% of max_position
+
+dt: 1.0                            # faster refresh; 2s is fine if API limits
+log_level: INFO                    # optional: DEBUG|INFO|WARN|ERROR
