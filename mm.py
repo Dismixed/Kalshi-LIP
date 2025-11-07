@@ -1849,15 +1849,15 @@ class LIPBot:
             f = float(raw)
             return to_tick(f/100.0 if f>1.0 else f)
 
-        # Keep only 1 best buy at bid; cancel others
+        # If we have inventory, cancel ALL buy orders
+        # Otherwise, keep only 1 best buy at bid; cancel others
         keep_buy = False
-        for o in buy_orders:
-            if _px(o) == bid and not keep_buy:
-                keep_buy = True
-            else:
+        if inventory > 0:
+            # Cancel all buy orders when we have inventory
+            for o in buy_orders:
                 try:
                     self.api.cancel_order(o["order_id"])
-                    self.logger.info(f"Canceling buy order for {ticker} [{side}] at {_px(o)} for {o.get('remaining_count', 0)} units")
+                    self.logger.info(f"Canceling buy order for {ticker} [{side}] at {_px(o)} for {o.get('remaining_count', 0)} units (inventory={inventory})")
                     if self.metrics:
                         self.metrics.record_order_canceled(o["order_id"], ticker, side, _px(o), o.get('remaining_count', 0))
                         self.metrics.record_action("cancel_order", {"action":"buy","side":side,"price":_px(o),"size":o.get("remaining_count",0)})
@@ -1867,6 +1867,24 @@ class LIPBot:
                     if self.metrics:
                         self.metrics.record_api_error("cancel_order", str(e), "cancel_order")
                     self.circuit_breaker.record_error("cancel_order", str(e))
+        else:
+            # Normal case: keep only 1 best buy at bid; cancel others
+            for o in buy_orders:
+                if _px(o) == bid and not keep_buy:
+                    keep_buy = True
+                else:
+                    try:
+                        self.api.cancel_order(o["order_id"])
+                        self.logger.info(f"Canceling buy order for {ticker} [{side}] at {_px(o)} for {o.get('remaining_count', 0)} units")
+                        if self.metrics:
+                            self.metrics.record_order_canceled(o["order_id"], ticker, side, _px(o), o.get('remaining_count', 0))
+                            self.metrics.record_action("cancel_order", {"action":"buy","side":side,"price":_px(o),"size":o.get("remaining_count",0)})
+                        self.circuit_breaker.record_success()
+                    except Exception as e:
+                        self.logger.error(f"Failed to cancel buy order: {e}")
+                        if self.metrics:
+                            self.metrics.record_api_error("cancel_order", str(e), "cancel_order")
+                        self.circuit_breaker.record_error("cancel_order", str(e))
 
         # Keep only 1 best sell at ask; cancel others
         keep_sell = False
