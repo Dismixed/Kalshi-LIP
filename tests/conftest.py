@@ -16,6 +16,8 @@ class FakeAPI:
     def __init__(self, balance: float = 0.0, orders=None):
         self._balance = balance
         self._orders_by_ticker = orders or {}
+        self._placed_orders = []
+        self._canceled_orders = []
 
     # Minimal surface used by tests
     def get_balance(self):
@@ -23,6 +25,22 @@ class FakeAPI:
 
     def get_orders(self, ticker: str):
         return list(self._orders_by_ticker.get(ticker, []))
+
+    def place_order(self, ticker: str, action: str, side: str, price: float, quantity: int, expiration_ts=None):
+        order_id = f"fake-order-{len(self._placed_orders)}"
+        self._placed_orders.append({
+            'order_id': order_id,
+            'ticker': ticker,
+            'action': action,
+            'side': side,
+            'price': price,
+            'quantity': quantity
+        })
+        return order_id
+
+    def cancel_order(self, order_id: str):
+        self._canceled_orders.append(order_id)
+        return True
 
     # Optional helpers
     def set_orders(self, ticker: str, orders):

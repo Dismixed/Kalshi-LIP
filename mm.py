@@ -159,6 +159,7 @@ class CircuitBreaker:
         with self.lock:
             if max_position > 0:
                 imbalance = abs(inventory) / max_position
+                self.logger.info(f"Inventory imbalance: {imbalance:.1%}, inventory={inventory}, max={max_position}")
                 if imbalance > self.max_inventory_imbalance and self.is_open:
                     self._trip(f"Inventory imbalance too high: {imbalance:.1%} (inventory={inventory}, max={max_position})")
                     
@@ -683,6 +684,107 @@ class KalshiTradingAPI(AbstractTradingAPI):
             except Exception:
                 pass
             return 0
+
+    def get_all_positions(self) -> Dict[str, int]:
+        """Get all positions across all tickers. Returns a dict mapping ticker -> position."""
+        try:
+            api_key_id = os.getenv("KALSHI_API_KEY_ID")
+            private_key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+            base_url = "https://api.elections.kalshi.com"
+
+            if not api_key_id or not private_key_path:
+                self.logger.error("Missing KALSHI_API_KEY_ID or KALSHI_PRIVATE_KEY_PATH")
+                return {}
+
+            # Load the private key from file (PEM)
+            with open(private_key_path, "rb") as f:
+                private_key = serialization.load_pem_private_key(f.read(), password=None)
+
+            def create_signature(private_key_obj, timestamp, method, path):
+                # Strip query parameters before signing
+                path_without_query = path.split('?')[0]
+                message = f"{timestamp}{method}{path_without_query}".encode('utf-8')
+                signature_bytes = private_key_obj.sign(
+                    message,
+                    padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+                    hashes.SHA256()
+                )
+                return base64.b64encode(signature_bytes).decode('utf-8')
+
+            timestamp = str(int(datetime.datetime.now().timestamp() * 1000))
+            method = "GET"
+            path = "/trade-api/v2/portfolio/positions"
+
+            signature = create_signature(private_key, timestamp, method, path)
+
+            headers = {
+                'KALSHI-ACCESS-KEY': api_key_id,
+                'KALSHI-ACCESS-SIGNATURE': signature,
+                'KALSHI-ACCESS-TIMESTAMP': timestamp
+            }
+
+            # No ticker parameter - get all positions
+            response = requests.get(base_url + path, headers=headers, timeout=10)
+            response.raise_for_status()
+            data = response.json() or {}
+
+            # Normalize market_positions into a list of dict-like records
+            market_positions = None
+            if isinstance(data, dict):
+                market_positions = data.get('market_positions')
+            if market_positions is None:
+                market_positions = getattr(data, 'market_positions', None)
+
+            # Coerce to list
+            if market_positions is None:
+                market_positions_list = []
+            elif isinstance(market_positions, list):
+                market_positions_list = market_positions
+            elif isinstance(market_positions, dict):
+                market_positions_list = [market_positions]
+            else:
+                # Attempt model -> dict
+                to_dict_fn = getattr(market_positions, 'to_dict', None)
+                if callable(to_dict_fn):
+                    try:
+                        as_dict = to_dict_fn() or {}
+                        inner = as_dict.get('market_positions')
+                        if isinstance(inner, list):
+                            market_positions_list = inner
+                        elif isinstance(inner, dict):
+                            market_positions_list = [inner]
+                        else:
+                            market_positions_list = []
+                    except Exception:
+                        market_positions_list = []
+                else:
+                    market_positions_list = []
+
+            # Build dict mapping ticker -> position
+            positions_dict = {}
+            for item in market_positions_list:
+                if isinstance(item, dict):
+                    tkr = item.get('ticker')
+                    pos = item.get('position', 0)
+                else:
+                    tkr = getattr(item, 'ticker', None)
+                    pos = getattr(item, 'position', 0)
+                
+                if tkr:
+                    try:
+                        positions_dict[tkr] = int(pos)
+                    except Exception:
+                        positions_dict[tkr] = 0
+
+            return positions_dict
+                    
+        except Exception as e:
+            self.logger.error(f"Failed to get all positions: {e}")
+            try:
+                self.logger.error(getattr(getattr(e, 'response', None), 'text', ''))
+            except Exception:
+                pass
+            return {}
 
     def get_price(self, ticker: str) -> Dict[str, float]:
         self.logger.info("Retrieving market data for market ticker: " + ticker)
@@ -1292,6 +1394,28 @@ class KalshiTradingAPI(AbstractTradingAPI):
                 self.logger.info(f"{ticker}: empty orderbook (both sides empty); skipping")
                 continue
 
+            # Skip if missing orders on either side
+            if not var_true or not var_false:
+                missing_side = "YES" if not var_true else "NO"
+                self.logger.info(f"{ticker}: missing orders on {missing_side} side; skipping")
+                continue
+
+            # Skip if top of orderbook is at 99c or 1c on either side
+            skip_market = False
+            price = self.get_price(ticker)
+            yes_mid = price.get("yes")
+            no_mid = price.get("no")
+            if yes_mid >= 0.99 or yes_mid <= 0.01:
+                self.logger.info(f"{ticker}: market is resolved; skipping")
+                skip_market = True
+            
+            if no_mid >= 0.99 or no_mid <= 0.01:
+                self.logger.info(f"{ticker}: market is resolved; skipping")
+                skip_market = True
+                
+            if skip_market:
+                continue
+
             target_size = int(market.get("target_size", 300))
             # Compute spread if both sides exist
             spread_val: Optional[float] = None
@@ -1421,6 +1545,24 @@ def score_side(side: str, entry: Dict) -> int:
 
     return int(round(1000 * _clip01(comp)))
 
+def yes_equiv_from(side: str, action: str, price: float) -> Tuple[str, float]:
+    """
+    Map (side, action, price) to the YES-equivalent (action_y, price_y).
+    - buy NO @ p  -> sell YES @ (1-p)
+    - sell NO @ p -> buy  YES @ (1-p)
+    - YES stays the same
+    """
+    price = to_tick(price)
+    if side == "yes":
+        return action, price
+    # side == "no"
+    y_price = to_tick(1.0 - price)
+    y_action = "sell" if action == "buy" else "buy"
+    return y_action, y_price
+
+def no_from_yes(action_y: str, price_y: float) -> Tuple[str, float]:
+    """If you ever need to send to NO side explicitly."""
+    return ("sell" if action_y == "buy" else "buy", to_tick(1.0 - price_y))
 
 class LIPBot:
     def __init__(
@@ -1437,6 +1579,7 @@ class LIPBot:
         max_consecutive_errors: int = 10,
         pnl_threshold: float = -100.0,
         max_inventory_imbalance: float = 0.8,
+        my_positions: Optional[List[str]] = None,
     ):
         self.api = api
         self.logger = logger
@@ -1447,6 +1590,7 @@ class LIPBot:
         self.improve_cooldown_seconds = int(improve_cooldown_seconds)
         self.min_quote_width = max(0.0, float(min_quote_width_cents or 0) / 100.0)
         self.stop_event = stop_event
+        self.my_positions = set(my_positions) if my_positions else set()  # Set of tickers that are personal positions
         
         # Monitoring and safety systems
         self.alert_manager = AlertManager(logger)
@@ -1518,12 +1662,29 @@ class LIPBot:
                         orders_by_ticker[tkr].append(o)
 
                 # Ensure tracked_markets includes any tickers with open orders
+                # Only track YES side (NO side orders will be cancelled)
                 for tkr in orders_by_ticker.keys():
                     tracked_markets.setdefault(tkr, {})
-                    for s in {o.get('side') for o in orders_by_ticker[tkr] if o.get('side')}:
-                        tracked_markets[tkr][s] = True
+                    tracked_markets[tkr]['yes'] = True
 
-                # For each tracked ticker/side, compute quotes and manage orders
+                # Also include tickers with positions (excluding my_positions)
+                # Note: Positive positions represent "yes" positions, negative positions represent "no" positions
+                try:
+                    if hasattr(self.api, 'get_all_positions'):
+                        all_positions = self.api.get_all_positions() or {}
+                        for ticker, position in all_positions.items():
+                            self.logger.info(f"Ticker: {ticker}, Position: {position}")
+                            # Only add if we have a non-zero position (positive = yes, negative = no) and it's not in my_positions
+                            if position != 0 and ticker not in self.my_positions:
+                                # Only track YES side to avoid duplicate positions
+                                # (buying YES = selling NO, so we only need to manage one side)
+                                tracked_markets.setdefault(ticker, {})
+                                tracked_markets[ticker]['yes'] = True
+                except Exception as e:
+                    self.logger.warning(f"Failed to fetch all positions for managed tickers: {e}")
+                # For each tracked ticker, compute quotes and manage orders
+                # IMPORTANT: Only manage YES side to avoid duplicate positions
+                # (buying YES = selling NO, so managing both creates duplicate orders)
                 for ticker in list(tracked_markets.keys()):
                     try:
                         touch = self.api.get_touch(ticker)
@@ -1537,76 +1698,111 @@ class LIPBot:
                         self.logger.warning(f"Failed to get position for {ticker}: {e}")
                         inventory = 0
 
-                    # manage per side we are tracking (or have orders on)
-                    for side in list(tracked_markets.get(ticker, {}).keys()):
-                        side_touch = touch.get(side)
-                        if not side_touch:
+                    # Only manage YES side - cancel any NO side orders first
+                    side = "yes"
+                    
+                    # Cancel all NO side orders (they're redundant with YES orders)
+                    no_orders = [o for o in orders_by_ticker.get(ticker, []) if o.get('side') == 'no']
+                    for o in no_orders:
+                        try:
+                            self.api.cancel_order(o["order_id"])
+                            self.logger.info(f"Canceling redundant NO order for {ticker} (we only manage YES side)")
+                            if self.metrics:
+                                self.metrics.record_order_canceled(o["order_id"], ticker, "no", 0, o.get('remaining_count', 0))
+                        except Exception as e:
+                            self.logger.error(f"Failed to cancel NO order: {e}")
+                    
+                    side_touch = touch.get(side)
+                    if not side_touch:
+                        continue
+                    mkt_bid, mkt_ask = side_touch
+                    spread = max(0.0, (mkt_ask - mkt_bid))
+                    
+                    # Check if market is resolved and cash out if needed
+                    if self.check_and_cashout_resolved_market(ticker, side, mkt_bid, mkt_ask, inventory):
+                        # Market is resolved and we attempted to cash out - skip normal order management
+                        self.logger.info(f"Skipping normal order management for resolved market {ticker}")
+                        continue
+                    
+                    # determine if best touch is ours (exclude our quotes for external-change detection)
+                    side_orders = [o for o in orders_by_ticker.get(ticker, []) if o.get('side') == side]
+                    def _px(o):
+                        raw = o.get("yes_price") if side == "yes" else o.get("no_price")
+                        f = float(raw)
+                        return to_tick(f/100.0 if f > 1.0 else f)
+                    our_best_buy = None
+                    our_best_sell = None
+                    for o in side_orders:
+                        act = o.get('action')
+                        try:
+                            p = _px(o)
+                        except Exception:
                             continue
-                        mkt_bid, mkt_ask = side_touch
-                        spread = max(0.0, (mkt_ask - mkt_bid))
-                        # determine if best touch is ours (exclude our quotes for external-change detection)
-                        side_orders = [o for o in orders_by_ticker.get(ticker, []) if o.get('side') == side]
-                        def _px(o):
-                            raw = o.get("yes_price") if side == "yes" else o.get("no_price")
-                            f = float(raw)
-                            return to_tick(f/100.0 if f > 1.0 else f)
-                        our_best_buy = None
-                        our_best_sell = None
-                        for o in side_orders:
-                            act = o.get('action')
-                            try:
-                                p = _px(o)
-                            except Exception:
-                                continue
-                            if act == 'buy':
-                                our_best_buy = max(our_best_buy, p) if our_best_buy is not None else p
-                            elif act == 'sell':
-                                our_best_sell = min(our_best_sell, p) if our_best_sell is not None else p
+                        if act == 'buy':
+                            our_best_buy = max(our_best_buy, p) if our_best_buy is not None else p
+                        elif act == 'sell':
+                            our_best_sell = min(our_best_sell, p) if our_best_sell is not None else p
 
-                        ext_bid = None if (our_best_buy is not None and to_tick(mkt_bid) == our_best_buy) else to_tick(mkt_bid)
-                        ext_ask = None if (our_best_sell is not None and to_tick(mkt_ask) == our_best_sell) else to_tick(mkt_ask)
-                        key = (ticker, side)
-                        last_ext = self._last_external_touch.get(key)
-                        external_changed = (last_ext != (ext_bid, ext_ask))
-                        if external_changed:
-                            self._improved_on_touch[key] = False
-                        now_ts = time.time()
-                        cooldown_ok = (self.improve_cooldown_seconds <= 0) or (now_ts - self._last_improve_ts.get(key, 0.0) >= self.improve_cooldown_seconds)
-                        allow_improvement = True
-                        if self.improve_once_per_touch:
-                            allow_improvement = (not self._improved_on_touch.get(key, False)) and cooldown_ok
+                    ext_bid = None if (our_best_buy is not None and to_tick(mkt_bid) == our_best_buy) else to_tick(mkt_bid)
+                    ext_ask = None if (our_best_sell is not None and to_tick(mkt_ask) == our_best_sell) else to_tick(mkt_ask)
+                    key = (ticker, side)
+                    last_ext = self._last_external_touch.get(key)
+                    external_changed = (last_ext != (ext_bid, ext_ask))
+                    if external_changed:
+                        self._improved_on_touch[key] = False
+                    now_ts = time.time()
+                    cooldown_ok = (self.improve_cooldown_seconds <= 0) or (now_ts - self._last_improve_ts.get(key, 0.0) >= self.improve_cooldown_seconds)
+                    allow_improvement = True
+                    if self.improve_once_per_touch:
+                        allow_improvement = (not self._improved_on_touch.get(key, False)) and cooldown_ok
 
-                        bid, ask = self.compute_quotes(mkt_bid, mkt_ask, inventory, allow_improvement=allow_improvement, min_width=self.min_quote_width)
-                        self.manage_orders(bid, ask, spread, ticker, inventory, side)
-                        # update gating state
-                        self._last_external_touch[key] = (ext_bid, ext_ask)
-                        if allow_improvement and inventory == 0 and spread >= 0.02:
-                            self._improved_on_touch[key] = True
-                            self._last_improve_ts[key] = now_ts
+                    bid, ask = self.compute_quotes(mkt_bid, mkt_ask, inventory, allow_improvement=allow_improvement, min_width=self.min_quote_width)
+                    self.manage_orders(bid, ask, spread, ticker, inventory, side)
+                    # update gating state
+                    self._last_external_touch[key] = (ext_bid, ext_ask)
+                    if allow_improvement and inventory == 0 and spread >= 0.02:
+                        self._improved_on_touch[key] = True
+                        self._last_improve_ts[key] = now_ts
 
                 # 2) Periodically discover new markets to enter
                 if (time.time() - last_discovery_ts) >= max(1.0, dt):
+                    self.logger.info(f"Discovering new markets")
                     try:
                         valid_markets = self.api.get_valid_markets() or []
                         valid_markets.sort(key=lambda x: x.get('score', 0), reverse=True)
+                        self.logger.info(f"Valid markets: {valid_markets}")
                     except Exception as e:
                         self.logger.warning(f"Market discovery failed: {e}")
                         valid_markets = []
 
                     # Try the top few candidates not currently tracked
+                    # Only consider YES side entries (to avoid duplicate positions)
                     for entry in valid_markets[:5]:
                         tkr = entry.get('ticker')
-                        side = entry.get('side')
-                        if not tkr or not side:
+                        entry_side = entry.get('side')
+                        if not tkr:
+                            self.logger.info(f"No ticker for market: {entry}")
                             continue
+                        # Skip NO side entries - we only manage YES side
+                        if entry_side == 'no':
+                            self.logger.info(f"No side for market: {entry}")
+                            entry = dict(entry)
+                            entry['side'] = 'yes'
+                            if entry.get('best_price') is not None:
+                                entry['best_price'] = to_tick(1.0 - float(entry['best_price']))
+
                         if tkr in orders_by_ticker:
+                            self.logger.info(f"Already have orders for market: {entry}")
                             continue  # already have orders
-                        # attempt to start managing this market/side
+                        # attempt to start managing this market (YES side only)
+                        side = "yes"
                         try:
                             touch = self.api.get_touch(tkr)
                             if side not in touch:
+                                self.logger.info(f"No touch for market: {entry}")
                                 continue
                             mkt_bid, mkt_ask = touch[side]
+                            self.logger.info(f"Mkt bid: {mkt_bid}, Mkt ask: {mkt_ask}")
                             inventory = self.api.get_position(tkr)
                             spread = max(0.0, (mkt_ask - mkt_bid))
                             # no orders yet; treat external touch as the live touch
@@ -1624,7 +1820,7 @@ class LIPBot:
                                 self._improved_on_touch[key] = True
                                 self._last_improve_ts[key] = now_ts
                             tracked_markets.setdefault(tkr, {})[side] = True
-                            self.logger.info(f"Started tracking market {tkr} [{side.upper()}]")
+                            self.logger.info(f"Started tracking market {tkr} [YES only - avoiding duplicate positions]")
                         except Exception as e:
                             self.logger.warning(f"Failed to initialize market {tkr}: {e}")
 
@@ -1636,10 +1832,21 @@ class LIPBot:
                         total_pnl = self._calculate_total_pnl(tracked_markets)
                         self.circuit_breaker.check_pnl(total_pnl)
                         
-                        # Check inventory imbalance across all tracked markets
+                        # Check inventory imbalance across all tracked markets (excluding resolved markets)
                         for ticker in tracked_markets.keys():
                             try:
                                 inventory = self.api.get_position(ticker)
+                                
+                                # Check if market is resolved - skip inventory check if it is
+                                try:
+                                    is_resolved, _ = self.resolved_from_bids(ticker)
+                                    
+                                    if is_resolved:
+                                        self.logger.debug(f"Skipping inventory check for resolved market {ticker}")
+                                        continue
+                                except Exception as e:
+                                    self.logger.debug(f"Could not check if {ticker} is resolved, will check inventory anyway: {e}")
+                                
                                 self.circuit_breaker.check_inventory_imbalance(inventory, self.max_position)
                                 
                                 # Alert on high inventory imbalance (but don't trip circuit yet)
@@ -1754,8 +1961,8 @@ class LIPBot:
         # lean away from your inventory
         skew = inventory * theta * spread
 
-        bid = to_tick(max(0.01, bid - skew))
-        ask = to_tick(min(0.99, ask + skew))
+        bid = to_tick(max(0.02, bid - skew))  # Avoid 1c orders
+        ask = to_tick(min(0.98, ask + skew))  # Avoid 99c orders
 
         # optional: nudge 1 tick better if spread >= 0.02, only when flat inventory
         if allow_improvement and inventory == 0 and spread >= 2 * tick:
@@ -1766,10 +1973,16 @@ class LIPBot:
         if min_width and (ask - bid) < min_width:
             deficit = min_width - (ask - bid)
             half = deficit / 2.0
-            bid = to_tick(max(0.01, bid - half))
-            ask = to_tick(min(0.99, ask + half))
+            bid = to_tick(max(0.02, bid - half))  # Avoid 1c orders
+            ask = to_tick(min(0.98, ask + half))  # Avoid 99c orders
             if ask <= bid:
-                ask = to_tick(min(0.99, bid + tick))
+                ask = to_tick(min(0.98, bid + tick))
+
+        # Final safety check: avoid extreme prices
+        if bid <= 0.01:
+            bid = 0.02
+        if ask >= 0.99:
+            ask = 0.98
 
         return bid, ask
 
@@ -1832,6 +2045,134 @@ class LIPBot:
             unit = (1.0 - price) if side == "yes" else price
         return unit * size + fee_per_contract * size
 
+
+    def _best_bid(self, levels):
+        """Extract best bid from orderbook levels [(price, count), ...]"""
+        if not levels:
+            return None
+        prices = [float(p) for p, cnt in levels if p is not None and (cnt or 0) > 0]
+        return max(prices) if prices else None
+
+    def resolved_from_bids(self, ticker: str):
+        """
+        Determine if market is resolved based on yes mid price.
+        Returns (resolved: bool, side: 'yes'|'no'|None).
+        """
+        EDGE_HIGH = 0.97  # treat ≥97c as "yes"
+        EDGE_LOW = 0.03   # treat ≤3c as "no"
+        
+        try:
+            prices = self.api.get_price(ticker)
+            yes_mid = prices.get("yes")
+            
+            self.logger.info(f"Yes mid price: {yes_mid}")
+            
+            if yes_mid is not None:
+                if yes_mid >= EDGE_HIGH:
+                    return True, "yes"
+                elif yes_mid <= EDGE_LOW:
+                    return True, "no"
+        except Exception as e:
+            self.logger.error(f"Error getting price for {ticker}: {e}")
+        
+        return False, None
+
+    def check_and_cashout_resolved_market(self, ticker: str, side: str, mkt_bid: float, mkt_ask: float, inventory: int) -> bool:
+        """
+        Check if market is resolved based on yes mid price and cash out position if needed.
+        Returns True if we cashed out (or attempted to), False otherwise.
+        """
+        is_resolved, resolved_side = self.resolved_from_bids(ticker)
+        cashout_action = None
+        cashout_price = None
+
+        self.logger.info(f"Checking if market is resolved: {ticker}, {side}, {mkt_bid}, {mkt_ask}, {inventory}")
+        self.logger.info(f"Resolved check result: is_resolved={is_resolved}, resolved_side={resolved_side}")
+        
+        if is_resolved and resolved_side:
+            # Market is resolved to a specific side
+            if resolved_side == "yes":
+                # Market resolved to YES
+                if inventory > 0:
+                    # We have YES position - sell at market (best bid)
+                    cashout_action = "sell"
+                    cashout_price = mkt_bid
+                elif inventory < 0:
+                    # We have NO position - buy it back at market to close (loss scenario)
+                    cashout_action = "buy"
+                    cashout_price = mkt_ask
+            elif resolved_side == "no":
+                # Market resolved to NO
+                if inventory < 0:
+                    # We have NO position - this is a win, buy back at market
+                    cashout_action = "buy"
+                    cashout_price = mkt_ask
+                elif inventory > 0:
+                    # We have YES position - sell at market (loss scenario)
+                    cashout_action = "sell"
+                    cashout_price = mkt_bid
+
+        self.logger.info(f"Is resolved: {is_resolved}, Resolved side: {resolved_side}, Cashout action: {cashout_action}, Cashout price: {cashout_price}")
+        
+        # If resolved with conflicting signals, skip trading but don't cashout
+        if is_resolved and resolved_side is None:
+            self.logger.info(f"⚠️  CONFLICTING SIGNALS for {ticker} - treating as resolved, skipping trading")
+            return True
+        
+        if is_resolved and inventory != 0 and cashout_action and cashout_price:
+            resolved_label = f"to {resolved_side.upper()}" if resolved_side else "conflicting signals"
+            self.logger.info(f"🎯 RESOLVED MARKET DETECTED: {ticker} {resolved_label}")
+            self.logger.info(f"   Inventory: {inventory}, Bid: {mkt_bid:.2f}, Ask: {mkt_ask:.2f}")
+            self.logger.info(f"   Cashing out: {cashout_action} at {cashout_price:.2f}")
+            
+            # First, cancel all existing orders for this market
+            try:
+                current_orders = self.api.get_orders(ticker) or []
+                for o in current_orders:
+                    try:
+                        self.api.cancel_order(o["order_id"])
+                        self.logger.info(f"   Canceled order {o['order_id']} before cashout")
+                        if self.metrics:
+                            self.metrics.record_order_canceled(o["order_id"], ticker, o.get('side', side), 0, o.get('remaining_count', 0))
+                    except Exception as e:
+                        self.logger.warning(f"   Failed to cancel order before cashout: {e}")
+            except Exception as e:
+                self.logger.warning(f"   Failed to fetch orders before cashout: {e}")
+            
+            # Now place the cashout order
+            try:
+                cashout_size = abs(inventory)
+                
+                if self.metrics:
+                    self.metrics.record_order_sent(ticker, side, cashout_action, cashout_price, cashout_size)
+                
+                oid = self.api.place_order(ticker, cashout_action, side, cashout_price, cashout_size, None)
+                self.logger.info(f"   ✅ Cashout order placed: {cashout_action} {cashout_size} @ {cashout_price:.2f}, order_id: {oid}")
+                
+                if self.metrics:
+                    self.metrics.record_order_acknowledged(oid, ticker, side, cashout_action, cashout_price, cashout_size)
+                    self.metrics.record_action("cashout_resolved", {
+                        "action": cashout_action,
+                        "side": side,
+                        "price": cashout_price,
+                        "size": cashout_size,
+                        "inventory": inventory,
+                        "market_bid": mkt_bid,
+                        "market_ask": mkt_ask
+                    })
+                
+                self.circuit_breaker.record_success()
+                return True
+                
+            except Exception as e:
+                self.logger.error(f"   ❌ Failed to place cashout order: {e}")
+                if self.metrics:
+                    self.metrics.record_order_rejected(ticker, side, cashout_action, cashout_price, cashout_size, str(e))
+                    self.metrics.record_api_error("cashout_order", str(e), "place_order")
+                self.circuit_breaker.record_error("cashout_order", str(e))
+                return True  # Still return True to skip normal order management
+        
+        return False  # Not a resolved market or no position to cash out
 
     def manage_orders(self, bid: float, ask: float, spread: float, ticker: str, inventory: int, side: str):
         # does it ever exit markets?
@@ -1927,7 +2268,7 @@ class LIPBot:
                 self.circuit_breaker.record_error("place_order", str(e))
 
         # Place sell only if you want to unload inventory (optional for LIP)
-        self.logger.info(f"Inventory: {inventory}, keep_sell: {keep_sell}, sell_size: {sell_size}")
+        self.logger.info(f"Ticker: {ticker}, Side: {side}, Inventory: {inventory}, keep_sell: {keep_sell}, sell_size: {sell_size}")
         if inventory > 0 and not keep_sell:
             try:
                 if self.metrics:

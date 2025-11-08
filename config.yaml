@@ -7,6 +7,9 @@ market_maker:
   improve_once_per_touch: true     # only one 1-tick nudge per external touch change
   improve_cooldown_seconds: 0      # optional cooldown between nudges (0 disables)
   min_quote_width_cents: 0         # optional spread floor in cents (0 keeps current behavior)
+  my_positions:                   # List of tickers that are personal positions (not managed by bot)
+     - KXSPOTIFYALBUMRELEASE-25-DRA
+     - KXNBAMVP-26-SGIL
 
 # Circuit breaker configuration
 circuit_breaker:

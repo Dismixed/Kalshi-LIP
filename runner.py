@@ -103,6 +103,7 @@ if __name__ == "__main__":
         max_consecutive_errors=cb_cfg.get('max_consecutive_errors', 10),
         pnl_threshold=cb_cfg.get('pnl_threshold', -100.0),
         max_inventory_imbalance=cb_cfg.get('max_inventory_imbalance', 0.8),
+        my_positions=mm_cfg.get('my_positions', None),
     )
 
     try:
