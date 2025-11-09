@@ -1580,6 +1580,7 @@ class LIPBot:
         pnl_threshold: float = -100.0,
         max_inventory_imbalance: float = 0.8,
         my_positions: Optional[List[str]] = None,
+        inventory_buy_threshold: float = 0.75,
     ):
         self.api = api
         self.logger = logger
@@ -1591,6 +1592,7 @@ class LIPBot:
         self.min_quote_width = max(0.0, float(min_quote_width_cents or 0) / 100.0)
         self.stop_event = stop_event
         self.my_positions = set(my_positions) if my_positions else set()  # Set of tickers that are personal positions
+        self.inventory_buy_threshold = float(inventory_buy_threshold)  # Stop buying when inventory > threshold * max_position
         
         # Monitoring and safety systems
         self.alert_manager = AlertManager(logger)
@@ -2181,9 +2183,12 @@ class LIPBot:
         buy_size = self.compute_desired_size(side, "buy", bid, spread, inventory)
         sell_size = inventory
         
-        # When we have inventory, only place sell orders to exit position
-        if inventory > 0:
+        # Stop buying when inventory exceeds threshold to prioritize exiting position
+        # This balances liquidity provision (earning rewards) with risk management
+        inventory_threshold = int(self.max_position * self.inventory_buy_threshold)
+        if inventory > inventory_threshold:
             buy_size = 0
+            self.logger.debug(f"Inventory {inventory} exceeds threshold {inventory_threshold} ({self.inventory_buy_threshold*100:.0f}% of {self.max_position}), stopping buy orders")
 
         # Partition by action for THIS side only
         buy_orders  = [o for o in current_orders if o.get("side")==side and o.get("action")=="buy"]

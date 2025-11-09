@@ -4,9 +4,10 @@ market_maker:
   max_position: 100                 # small but less constraining than 5
   position_limit_buffer: 0.2      # start leaning before the cliff
   inventory_skew_factor: 0.01     # noticeably tilt quotes as q grows
-  improve_once_per_touch: true     # only one 1-tick nudge per external touch change
+  improve_once_per_touch: false     # only one 1-tick nudge per external touch change
   improve_cooldown_seconds: 0      # optional cooldown between nudges (0 disables)
   min_quote_width_cents: 0         # optional spread floor in cents (0 keeps current behavior)
+  inventory_buy_threshold: 0.75    # stop placing buy orders when inventory > 75% of max_position (balances liquidity rewards with risk)
   my_positions:                   # List of tickers that are personal positions (not managed by bot)
      - KXSPOTIFYALBUMRELEASE-25-DRA
      - KXNBAMVP-26-SGIL
