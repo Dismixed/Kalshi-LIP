@@ -2180,6 +2180,10 @@ class LIPBot:
 
         buy_size = self.compute_desired_size(side, "buy", bid, spread, inventory)
         sell_size = inventory
+        
+        # When we have inventory, only place sell orders to exit position
+        if inventory > 0:
+            buy_size = 0
 
         # Partition by action for THIS side only
         buy_orders  = [o for o in current_orders if o.get("side")==side and o.get("action")=="buy"]
