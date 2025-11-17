@@ -1854,6 +1854,60 @@ class KalshiTradingAPI(AbstractTradingAPI):
         self.logger.info(f"  Dropped - Resolved: {drop_resolved}")
         self.logger.info(f"Valid markets: {len(valid_markets)}")
         return valid_markets
+
+    def get_candlesticks(
+        self,
+        market_ticker: str,
+        start_ts: Optional[int] = None,
+        end_ts: Optional[int] = None,
+        period_interval: int = 1
+    ) -> List[Dict]:
+        """
+        Fetch candlestick data for a market.
+        
+        Args:
+            market_ticker: The market ticker
+            start_ts: Start timestamp (Unix seconds). If None, defaults to 72 hours ago
+            end_ts: End timestamp (Unix seconds). If None, defaults to now
+            period_interval: Interval in minutes (1, 5, 15, 60, etc.)
+        
+        Returns:
+            List of candlestick dicts with keys: open_ts, close_ts, open, high, low, close, volume
+        """
+        try:
+            now = int(time.time())
+            if start_ts is None:
+                start_ts = now - (72 * 3600)  # 72 hours ago
+            if end_ts is None:
+                end_ts = now
+            
+            # Use the Kalshi SDK method if available
+            response = self.client.get_market_candlesticks(
+                market_ticker=market_ticker,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                period_interval=period_interval
+            )
+            
+            # Parse response
+            candlesticks = []
+            if hasattr(response, 'candlesticks'):
+                for candle in response.candlesticks:
+                    candlesticks.append({
+                        'end_period_ts': getattr(candle, 'end_period_ts', None),
+                        'yes_bid': getattr(candle, 'yes_bid', None),
+                        'yes_ask': getattr(candle, 'yes_ask', None),
+                        'price': getattr(candle, 'price', None),
+                        'volume': getattr(candle, 'volume', None),
+                        'open_interest': getattr(candle, 'open_interest', None),
+                    })
+            
+            self.logger.debug(f"Fetched {len(candlesticks)} candlesticks for {market_ticker}")
+            return candlesticks
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch candlesticks for {market_ticker}: {e}")
+            return []
             
 
 def _gauss(x: float, mu: float, sigma: float) -> float:
@@ -2036,6 +2090,12 @@ class LIPBot:
         self._last_target_refresh_ts = 0.0
         self._target_refresh_interval = 60.0  # seconds
         
+        # Cross-sectional volatility ranking
+        self._vol_cache: Dict[str, float] = {}  # ticker -> raw volatility
+        self._vol_percentiles: Dict[str, float] = {}  # ticker -> percentile [0, 1]
+        self._last_vol_refresh_ts = 0.0
+        self._vol_refresh_interval = float(os.getenv("LIP_VOL_REFRESH_INTERVAL", "300.0"))  # 5 minutes
+        
         # WebSocket fill tracker (will be started when run() is called)
         self.ws_fill_tracker: Optional[WebSocketFillTracker] = None
 
@@ -2044,6 +2104,20 @@ class LIPBot:
 
         # How many candidates to scan per cycle before giving up (safety cap)
         self.discovery_scan_cap = int(os.getenv("LIP_DISCOVERY_SCAN_CAP", "100"))
+
+        # LIP risk-based quoting parameters
+        self.lip_enabled = bool(int(os.getenv("LIP_RISK_ENABLED", "1")))  # Enable LIP risk-adjusted quoting
+        self.lip_discount_factor = float(os.getenv("LIP_DISCOUNT_FACTOR", "0.95"))  # LIP DF for multipliers
+        self.lip_risk_threshold = float(os.getenv("LIP_RISK_THRESHOLD", "3.0"))  # Max risk score
+        self.lip_risk_alpha = float(os.getenv("LIP_RISK_ALPHA", "1.0"))  # Quote distance scaling
+        self.lip_time_risk_k = float(os.getenv("LIP_TIME_RISK_K", "0.15"))  # Time decay constant
+        self.lip_vol_gamma = float(os.getenv("LIP_VOL_GAMMA", "2.0"))  # Volatility scaling factor
+        
+        self.logger.info(f"LIP risk-based quoting: {'ENABLED' if self.lip_enabled else 'DISABLED'}")
+        if self.lip_enabled:
+            self.logger.info(f"  Discount Factor: {self.lip_discount_factor}")
+            self.logger.info(f"  Risk Threshold: {self.lip_risk_threshold}")
+            self.logger.info(f"  Risk Alpha: {self.lip_risk_alpha}")
 
         def on_fill(self, fill: Dict) -> None:
             """
@@ -2174,6 +2248,90 @@ class LIPBot:
         except Exception as e:
             self.logger.warning(f"Target-size refresh failed: {e}")
 
+    def _refresh_cross_sectional_volatility(self, candidate_tickers: List[str]):
+        """
+        Compute cross-sectional volatility percentiles across candidate markets.
+        
+        This method:
+        1. Computes raw volatility for all candidate tickers
+        2. Ranks them to get percentile scores [0, 1]
+        3. Caches both raw volatilities and percentiles
+        
+        Args:
+            candidate_tickers: List of market tickers to analyze
+        """
+        now = time.time()
+        
+        # Check if refresh is needed
+        if now - self._last_vol_refresh_ts < self._vol_refresh_interval:
+            self.logger.debug("Volatility cache still fresh, skipping refresh")
+            return
+        
+        self.logger.info(f"Refreshing cross-sectional volatility for {len(candidate_tickers)} markets...")
+        
+        # Compute raw volatilities for all candidates
+        vol_map: Dict[str, float] = {}
+        for ticker in candidate_tickers:
+            try:
+                vol = self.compute_volatility_risk(ticker, lookback_hours=48, ewma_alpha=0.3)
+                vol_map[ticker] = vol
+            except Exception as e:
+                self.logger.warning(f"Failed to compute volatility for {ticker}: {e}")
+                vol_map[ticker] = 0.1  # default
+        
+        # Store raw volatilities in cache
+        self._vol_cache = vol_map
+        
+        # Convert to percentile ranks
+        if len(vol_map) > 1:
+            sorted_vols = sorted(vol_map.values())
+            n = len(sorted_vols)
+            
+            for ticker, vol in vol_map.items():
+                # Find rank (0-based index in sorted list)
+                try:
+                    rank = sorted_vols.index(vol)
+                    # Convert to percentile [0, 1]
+                    percentile = rank / (n - 1) if n > 1 else 0.5
+                    self._vol_percentiles[ticker] = percentile
+                except ValueError:
+                    # Fallback if exact match fails
+                    self._vol_percentiles[ticker] = 0.5
+        else:
+            # Only one market, default to middle
+            for ticker in vol_map:
+                self._vol_percentiles[ticker] = 0.5
+        
+        self._last_vol_refresh_ts = now
+        
+        # Log summary statistics
+        if vol_map:
+            vols = list(vol_map.values())
+            self.logger.info(
+                f"Volatility stats: min={min(vols):.4f}, "
+                f"median={sorted(vols)[len(vols)//2]:.4f}, "
+                f"max={max(vols):.4f}"
+            )
+            
+            # Log top 5 most volatile markets
+            sorted_by_vol = sorted(vol_map.items(), key=lambda x: x[1], reverse=True)
+            self.logger.info("Most volatile markets:")
+            for ticker, vol in sorted_by_vol[:5]:
+                percentile = self._vol_percentiles.get(ticker, 0.5)
+                self.logger.info(f"  {ticker}: σ={vol:.4f} (p{percentile*100:.0f})")
+
+    def get_volatility_percentile(self, ticker: str) -> Optional[float]:
+        """
+        Get cached volatility percentile for a ticker.
+        
+        Args:
+            ticker: Market ticker
+        
+        Returns:
+            Percentile rank [0, 1] or None if not in cache
+        """
+        return self._vol_percentiles.get(ticker)
+
 
     def _update_markout_ema(self, ticker: str, realized_markout: float):
         """EMA update and bump state."""
@@ -2197,6 +2355,312 @@ class LIPBot:
             return None
         now = time.time()
         return max(0.0, (end_ts - now) / 3600.0)
+
+    def build_qualifying_band(
+        self,
+        orderbook_levels: List[Tuple[float, int]],
+        target_size: int,
+        is_bid_side: bool,
+        discount_factor: float = 0.95
+    ) -> Optional[List[Dict]]:
+        """
+        Build the LIP qualifying band for one side of the market.
+        
+        Args:
+            orderbook_levels: List of (price, size) tuples sorted from best to worst
+            target_size: The LIP target size requirement
+            is_bid_side: True for bids (descending prices), False for asks (ascending)
+            discount_factor: The LIP discount factor (e.g., 0.95)
+        
+        Returns:
+            List of qualifying level dicts with keys:
+                - price: the price level
+                - size: the size at that level
+                - ticks_from_best: 0 for best, 1 for second best, etc.
+                - multiplier: DF^ticks_from_best
+            Returns None if the book is too thin to reach target_size.
+        """
+        if not orderbook_levels or target_size <= 0:
+            return None
+        
+        qual_levels = []
+        cum_size = 0
+        
+        for i, (price, size) in enumerate(orderbook_levels):
+            if size <= 0:
+                continue
+            
+            ticks_from_best = i
+            multiplier = discount_factor ** ticks_from_best
+            
+            qual_levels.append({
+                'price': price,
+                'size': size,
+                'ticks_from_best': ticks_from_best,
+                'multiplier': multiplier
+            })
+            
+            cum_size += size
+            
+            # If we've reached target_size, we're done
+            if cum_size >= target_size:
+                self.logger.debug(
+                    f"Qualifying band complete: {len(qual_levels)} levels, "
+                    f"cumulative size {cum_size} >= target {target_size}"
+                )
+                return qual_levels
+        
+        # If we get here, the book was too thin
+        self.logger.debug(
+            f"Book too thin: cumulative size {cum_size} < target {target_size}"
+        )
+        return None
+
+    def compute_lip_intensity(
+        self,
+        qualifying_band: List[Dict],
+        target_size: int
+    ) -> float:
+        """
+        Compute LIP intensity (crowding) signal for a side.
+        
+        Args:
+            qualifying_band: The qualifying band from build_qualifying_band
+            target_size: The LIP target size
+        
+        Returns:
+            coverage_top = size_at_best / target_size
+            Higher values indicate more crowding at the top of book.
+        """
+        if not qualifying_band or target_size <= 0:
+            return 0.0
+        
+        # Find size at best (ticks_from_best == 0)
+        size_at_best = 0
+        for level in qualifying_band:
+            if level['ticks_from_best'] == 0:
+                size_at_best = level['size']
+                break
+        
+        coverage_top = size_at_best / target_size
+        return coverage_top
+
+    def compute_time_risk(
+        self,
+        ticker: str,
+        k: float = 0.15
+    ) -> float:
+        """
+        Compute time risk using exponential decay.
+        
+        Args:
+            ticker: Market ticker
+            k: Decay constant (higher = faster decay with time)
+               k ~ 0.15 gives TimeRisk ~ 0.2 at 24h, ~ 0.8 at 3h
+        
+        Returns:
+            TimeRisk in [0, 1], where higher = closer to expiry (riskier)
+        """
+        hours = self._hours_to_expiry(ticker)
+        if hours is None:
+            # Unknown expiry - assume moderate risk
+            return 0.5
+        
+        # exp(-k * hours) is near 1 for small hours, near 0 for large hours
+        time_risk = math.exp(-k * hours)
+        
+        # Clamp to ensure it doesn't collapse to exactly 0
+        time_risk = max(0.01, min(1.0, time_risk))
+        
+        return time_risk
+
+    def compute_volatility_risk(
+        self,
+        ticker: str,
+        lookback_hours: int = 48,
+        ewma_alpha: float = 0.3
+    ) -> float:
+        """
+        Compute volatility risk from candlestick data using logit returns.
+        
+        Args:
+            ticker: Market ticker
+            lookback_hours: How many hours of history to fetch
+            ewma_alpha: EWMA smoothing parameter (0 < alpha <= 1)
+        
+        Returns:
+            Volatility estimate (sigma) in logit space.
+            Returns a default value if candlestick data is insufficient.
+        """
+        try:
+            now = int(time.time())
+            start_ts = now - (lookback_hours * 3600)
+            
+            # Fetch candlesticks (5-minute intervals for decent granularity)
+            candlesticks = self.api.get_candlesticks(
+                market_ticker=ticker,
+                start_ts=start_ts,
+                end_ts=now,
+                period_interval=5
+            )
+            
+            if len(candlesticks) < 3:
+                # Not enough data
+                self.logger.debug(f"Insufficient candlestick data for {ticker}")
+                return 0.1  # default low volatility
+            
+            # Compute logit midprices
+            logit_prices = []
+            for candle in candlesticks:
+                price = candle.get('price')
+                if price is None:
+                    continue
+                
+                # Ensure price is in [0.01, 0.99] to avoid log(0) or log(negative)
+                p = max(0.01, min(0.99, float(price)))
+                
+                # logit(p) = log(p / (1 - p))
+                logit_p = math.log(p / (1.0 - p))
+                logit_prices.append(logit_p)
+            
+            if len(logit_prices) < 2:
+                return 0.1  # default
+            
+            # Compute returns: r_t = logit_t - logit_{t-1}
+            returns = []
+            for i in range(1, len(logit_prices)):
+                r = logit_prices[i] - logit_prices[i-1]
+                returns.append(r)
+            
+            if not returns:
+                return 0.1
+            
+            # Compute EWMA of absolute returns (or squared returns)
+            # Using absolute returns for simplicity
+            sigma = abs(returns[0])
+            for r in returns[1:]:
+                sigma = ewma_alpha * abs(r) + (1.0 - ewma_alpha) * sigma
+            
+            return sigma
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to compute volatility risk for {ticker}: {e}")
+            return 0.1  # default
+
+    def compute_risk_score(
+        self,
+        ticker: str,
+        vol_percentiles: Optional[Dict[str, float]] = None,
+        gamma: float = 2.0,
+        use_cached_percentiles: bool = True
+    ) -> float:
+        """
+        Compute combined risk score = TimeRisk × VolFactor.
+        
+        Args:
+            ticker: Market ticker
+            vol_percentiles: Optional dict mapping ticker -> percentile rank [0, 1]
+                            If None and use_cached_percentiles=True, will use cached values
+            gamma: Scaling factor for volatility (vol_factor = 1 + gamma * vol_score)
+            use_cached_percentiles: If True, automatically use cached cross-sectional percentiles
+        
+        Returns:
+            risk_score: Combined risk metric. Higher = riskier.
+        """
+        time_risk = self.compute_time_risk(ticker, k=self.lip_time_risk_k)
+        
+        # Try to get volatility percentile from multiple sources
+        vol_score = None
+        
+        # 1. Explicit percentiles dict provided
+        if vol_percentiles and ticker in vol_percentiles:
+            vol_score = vol_percentiles[ticker]
+            self.logger.debug(f"{ticker}: Using provided percentile: {vol_score:.3f}")
+        
+        # 2. Cached cross-sectional percentiles
+        elif use_cached_percentiles and ticker in self._vol_percentiles:
+            vol_score = self._vol_percentiles[ticker]
+            self.logger.debug(f"{ticker}: Using cached percentile: {vol_score:.3f}")
+        
+        # 3. Fallback to raw volatility scaled heuristically
+        else:
+            vol_sigma = self.compute_volatility_risk(ticker)
+            # Normalize raw sigma to [0, 1] using a heuristic scale
+            # Typical logit volatility might range 0.05 to 0.5
+            vol_score = min(1.0, vol_sigma / 0.5)
+            self.logger.debug(f"{ticker}: Using raw volatility σ={vol_sigma:.4f} -> score={vol_score:.3f}")
+        
+        # Clip vol_score to avoid extreme values
+        vol_score = max(0.05, min(0.95, vol_score))
+        
+        vol_factor = 1.0 + gamma * vol_score
+        
+        risk_score = time_risk * vol_factor
+        
+        return risk_score
+
+    def determine_quote_level(
+        self,
+        qualifying_band: List[Dict],
+        risk_score: float,
+        alpha: float = 1.0,
+        inventory: int = 0,
+        max_position: int = 100,
+        is_bid: bool = True
+    ) -> Optional[Dict]:
+        """
+        Determine which level in the qualifying band to quote at.
+        
+        Args:
+            qualifying_band: The qualifying band from build_qualifying_band
+            risk_score: The combined risk score for this market
+            alpha: Scaling parameter (max_ticks = floor(alpha * risk_score))
+            inventory: Current inventory (positive = long)
+            max_position: Maximum allowed position
+            is_bid: True if quoting on bid side, False for ask side
+        
+        Returns:
+            The selected level dict from qualifying_band, or None if no level is suitable.
+        """
+        if not qualifying_band:
+            return None
+        
+        # Compute allowed distance from top based on risk
+        max_ticks = int(math.floor(alpha * risk_score))
+        
+        # Respect the LIP band limits
+        max_qual_ticks = max(level['ticks_from_best'] for level in qualifying_band)
+        max_ticks = min(max_ticks, max_qual_ticks)
+        
+        # Apply inventory skew: if we're long, back off from bidding aggressively
+        # if we're short, back off from asking aggressively
+        inventory_factor = abs(inventory) / max(1, max_position)
+        
+        if is_bid and inventory > 0:
+            # Long inventory: less aggressive on bids (sit further back)
+            max_ticks = int(max_ticks + inventory_factor * 2)
+        elif not is_bid and inventory < 0:
+            # Short inventory: less aggressive on asks
+            max_ticks = int(max_ticks + inventory_factor * 2)
+        
+        # Re-clamp to qualifying band
+        max_ticks = min(max_ticks, max_qual_ticks)
+        
+        # Filter to levels within allowed distance
+        eligible_levels = [
+            level for level in qualifying_band
+            if level['ticks_from_best'] <= max_ticks
+        ]
+        
+        if not eligible_levels:
+            # Fall back to furthest qualifying level
+            return qualifying_band[-1]
+        
+        # Default: choose the level closest to top (best multiplier)
+        # This is the first eligible level (ticks_from_best is smallest)
+        chosen_level = min(eligible_levels, key=lambda x: x['ticks_from_best'])
+        
+        return chosen_level
 
     def _drain_markout_checks(self):
         """Run due markout checks enqueued by fills (short + long horizons)."""
@@ -2609,6 +3073,15 @@ class LIPBot:
                 if (now_ts - self._last_target_refresh_ts) >= self._target_refresh_interval:
                     self._refresh_target_sizes()
                     self._last_target_refresh_ts = now_ts
+                
+                # Refresh cross-sectional volatility periodically (uses tracked_markets tickers)
+                if self.lip_enabled and (now_ts - self._last_vol_refresh_ts) >= self._vol_refresh_interval:
+                    candidate_tickers = list(tracked_markets.keys())
+                    if candidate_tickers:
+                        try:
+                            self._refresh_cross_sectional_volatility(candidate_tickers)
+                        except Exception as e:
+                            self.logger.warning(f"Cross-sectional volatility refresh failed: {e}")
 
                 
                 # Check circuit breaker before proceeding
@@ -3034,6 +3507,126 @@ class LIPBot:
             ask = to_tick(min(0.98, mid + half))
 
         return bid, ask
+
+    def compute_lip_adjusted_quotes(
+        self,
+        ticker: str,
+        orderbook: Dict,
+        target_size: int,
+        inventory: int,
+        discount_factor: float = 0.95,
+        risk_threshold: float = 3.0,
+        alpha: float = 1.0
+    ) -> Dict:
+        """
+        Compute LIP-optimized quotes considering qualifying bands and risk scores.
+        
+        Args:
+            ticker: Market ticker
+            orderbook: The full orderbook dict
+            target_size: LIP target size
+            inventory: Current inventory (positive = long)
+            discount_factor: LIP discount factor (e.g., 0.95)
+            risk_threshold: Maximum acceptable risk score (skip if exceeded)
+            alpha: Scaling factor for quote distance (max_ticks = floor(alpha * risk_score))
+        
+        Returns:
+            Dict with keys:
+                - bid_price: Recommended bid price (or None)
+                - ask_price: Recommended ask price (or None)
+                - bid_size: Recommended bid size (or 0)
+                - ask_size: Recommended ask size (or 0)
+                - risk_score: The computed risk score
+                - lip_intensity_bid: Coverage ratio for bids
+                - lip_intensity_ask: Coverage ratio for asks
+                - skip_reason: Reason for skipping (if applicable)
+        """
+        result = {
+            'bid_price': None,
+            'ask_price': None,
+            'bid_size': 0,
+            'ask_size': 0,
+            'risk_score': 0.0,
+            'lip_intensity_bid': 0.0,
+            'lip_intensity_ask': 0.0,
+            'skip_reason': None
+        }
+        
+        # Extract YES-equivalent orderbook levels
+        yes_bids = [(to_tick(p), sz) for (p, sz) in (orderbook.get("var_true") or [])]
+        yes_asks = [(to_tick(1.0 - p), sz) for (p, sz) in (orderbook.get("var_false") or [])]
+        
+        # Sort: bids descending (best first), asks ascending (best first)
+        yes_bids = sorted(yes_bids, key=lambda x: x[0], reverse=True)
+        yes_asks = sorted(yes_asks, key=lambda x: x[0])
+        
+        # Compute risk score for this market (uses cached percentiles automatically)
+        risk_score = self.compute_risk_score(
+            ticker,
+            gamma=self.lip_vol_gamma,
+            use_cached_percentiles=True
+        )
+        result['risk_score'] = risk_score
+        
+        # Apply hard risk filter
+        if risk_score > risk_threshold:
+            result['skip_reason'] = f"Risk score {risk_score:.2f} exceeds threshold {risk_threshold}"
+            self.logger.info(f"{ticker}: {result['skip_reason']}")
+            return result
+        
+        # Build qualifying bands for each side
+        bid_band = self.build_qualifying_band(yes_bids, target_size, is_bid_side=True, discount_factor=discount_factor)
+        ask_band = self.build_qualifying_band(yes_asks, target_size, is_bid_side=False, discount_factor=discount_factor)
+        
+        # Compute LIP intensity for each side
+        if bid_band:
+            lip_intensity_bid = self.compute_lip_intensity(bid_band, target_size)
+            result['lip_intensity_bid'] = lip_intensity_bid
+            
+            # Optionally filter by intensity (prefer moderate crowding)
+            # For now, we just log it
+            if lip_intensity_bid > 3.0:
+                self.logger.debug(f"{ticker}: High LIP intensity on bids: {lip_intensity_bid:.2f}")
+        
+        if ask_band:
+            lip_intensity_ask = self.compute_lip_intensity(ask_band, target_size)
+            result['lip_intensity_ask'] = lip_intensity_ask
+            
+            if lip_intensity_ask > 3.0:
+                self.logger.debug(f"{ticker}: High LIP intensity on asks: {lip_intensity_ask:.2f}")
+        
+        # Determine quote levels based on risk score
+        if bid_band:
+            bid_level = self.determine_quote_level(
+                bid_band,
+                risk_score,
+                alpha=alpha,
+                inventory=inventory,
+                max_position=self.max_position,
+                is_bid=True
+            )
+            if bid_level:
+                result['bid_price'] = bid_level['price']
+                # Size should be min of level size and our capacity
+                remaining_capacity = max(0, self.max_position - abs(inventory))
+                result['bid_size'] = min(bid_level['size'], remaining_capacity)
+        
+        if ask_band and inventory > 0:
+            # Only quote asks if we have inventory to exit
+            ask_level = self.determine_quote_level(
+                ask_band,
+                risk_score,
+                alpha=alpha,
+                inventory=inventory,
+                max_position=self.max_position,
+                is_bid=False
+            )
+            if ask_level:
+                result['ask_price'] = ask_level['price']
+                # Size capped by current inventory
+                result['ask_size'] = min(ask_level['size'], inventory)
+        
+        return result
 
     def compute_desired_size(self, ticker: str, side: str, action: str, price: float, spread: float, inventory: int, min_order_size: int = 1) -> int:
         """
