@@ -105,6 +105,7 @@ if __name__ == "__main__":
         max_inventory_imbalance=cb_cfg.get('max_inventory_imbalance', 0.8),
         my_positions=mm_cfg.get('my_positions', None),
         inventory_buy_threshold=mm_cfg.get('inventory_buy_threshold', 0.75),
+        max_workers=mm_cfg.get('max_workers', 5),
     )
 
     try:

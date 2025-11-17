@@ -8,6 +8,7 @@ market_maker:
   improve_cooldown_seconds: 0      # optional cooldown between nudges (0 disables)
   min_quote_width_cents: 0         # optional spread floor in cents (0 keeps current behavior)
   inventory_buy_threshold: 0.75    # stop placing buy orders when inventory > 75% of max_position (balances liquidity rewards with risk)
+  max_workers: 5                   # number of parallel threads for processing markets (default: 5)
   my_positions:                   # List of tickers that are personal positions (not managed by bot)
      - KXSPOTIFYALBUMRELEASE-25-DRA
      - KXNBAMVP-26-SGIL
