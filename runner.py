@@ -106,6 +106,9 @@ if __name__ == "__main__":
         my_positions=mm_cfg.get('my_positions', None),
         inventory_buy_threshold=mm_cfg.get('inventory_buy_threshold', 0.75),
         max_workers=mm_cfg.get('max_workers', 5),
+        max_markets_with_orders=mm_cfg.get('max_markets_with_orders', 20),
+        discovery_interval_seconds=mm_cfg.get('discovery_interval_seconds', 10),
+        orderbook_update_cooldown_ms=mm_cfg.get('orderbook_update_cooldown_ms', 500),
     )
 
     try:

@@ -28,6 +28,7 @@ from enum import Enum
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import asyncio
 import websockets
+import queue
 
 def to_tick(p: float) -> float:
     # Clamp to valid cents 0.01..0.99 and use round-half-up to 2 decimals
@@ -788,6 +789,392 @@ class WebSocketFillTracker:
         self.logger.info("WebSocket fill tracker stopped")
 
 
+class WebSocketOrderbookTracker:
+    """
+    WebSocket connection to track orderbook updates in real-time.
+    Based on Kalshi's WebSocket API: https://docs.kalshi.com/websockets/orderbook
+    """
+    def __init__(
+        self,
+        logger: logging.Logger,
+        bot: Optional['LIPBot'] = None,
+        stop_event: Optional[threading.Event] = None,
+        cooldown_ms: int = 500
+    ):
+        self.logger = logger
+        self.bot = bot  # Reference to the bot for sell order updates
+        self.stop_event = stop_event or threading.Event()
+        self.cooldown_ms = cooldown_ms
+        self.ws = None
+        self.ws_thread = None
+        self.message_id = 1
+        self.is_running = False
+        self.reconnect_delay = 1.0  # Start with 1 second
+        self.max_reconnect_delay = 60.0  # Max 60 seconds
+        
+        # Track subscribed markets and their state
+        self.subscribed_tickers = set()
+        self.subscription_lock = threading.Lock()
+        
+        # Track last update time per market (for rate limiting)
+        self.last_update_ts = {}
+        
+        # Track orderbook state (best bid/ask only)
+        self.orderbooks = {}  # ticker -> {'best_bid': price, 'best_ask': price}
+        
+    def _create_auth_headers(self) -> Dict[str, str]:
+        """Create authentication headers for WebSocket connection"""
+        api_key_id = os.getenv("KALSHI_API_KEY_ID")
+        private_key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+        
+        if not api_key_id or not private_key_path:
+            self.logger.error("Missing KALSHI_API_KEY_ID or KALSHI_PRIVATE_KEY_PATH for WebSocket")
+            return {}
+        
+        try:
+            # Load the private key
+            with open(private_key_path, "rb") as f:
+                private_key = serialization.load_pem_private_key(f.read(), password=None)
+            
+            # Create signature
+            timestamp = str(int(time.time() * 1000))
+            method = "GET"
+            path = "/trade-api/ws/v2"
+            message = f"{timestamp}{method}{path}".encode('utf-8')
+            
+            signature_bytes = private_key.sign(
+                message,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.DIGEST_LENGTH
+                ),
+                hashes.SHA256()
+            )
+            signature = base64.b64encode(signature_bytes).decode('utf-8')
+            
+            return {
+                'KALSHI-ACCESS-KEY': api_key_id,
+                'KALSHI-ACCESS-SIGNATURE': signature,
+                'KALSHI-ACCESS-TIMESTAMP': timestamp
+            }
+        except Exception as e:
+            self.logger.error(f"Failed to create WebSocket auth headers: {e}")
+            return {}
+    
+    async def _connect_and_listen(self):
+        """Main WebSocket connection loop with automatic reconnection"""
+        ws_url = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+        
+        while not self.stop_event.is_set():
+            try:
+                # Create auth headers
+                auth_headers = self._create_auth_headers()
+                if not auth_headers:
+                    self.logger.error("Failed to create auth headers, waiting before retry...")
+                    await asyncio.sleep(self.reconnect_delay)
+                    continue
+                
+                # Connect to WebSocket
+                self.logger.info(f"Connecting to orderbook WebSocket: {ws_url}")
+                async with websockets.connect(
+                    ws_url,
+                    additional_headers=auth_headers,
+                    ping_interval=20,  # Send ping every 20 seconds
+                    ping_timeout=10    # Timeout after 10 seconds
+                ) as websocket:
+                    self.ws = websocket
+                    self.logger.info("Orderbook WebSocket connected successfully")
+                    
+                    # Reset reconnect delay on successful connection
+                    self.reconnect_delay = 1.0
+                    
+                    # Re-subscribe to all tracked tickers after reconnection
+                    with self.subscription_lock:
+                        tickers_to_subscribe = list(self.subscribed_tickers)
+                    
+                    for ticker in tickers_to_subscribe:
+                        await self._subscribe_to_ticker(websocket, ticker)
+                    
+                    # Listen for messages
+                    async for message in websocket:
+                        if self.stop_event.is_set():
+                            break
+                        await self._process_message(message)
+                        
+            except websockets.exceptions.ConnectionClosed as e:
+                self.logger.warning(f"Orderbook WebSocket connection closed: {e}")
+                if not self.stop_event.is_set():
+                    await self._handle_reconnect()
+                    
+            except Exception as e:
+                self.logger.error(f"Orderbook WebSocket error: {e}")
+                if not self.stop_event.is_set():
+                    await self._handle_reconnect()
+        
+        self.logger.info("Orderbook WebSocket tracker stopped")
+    
+    async def _subscribe_to_ticker(self, websocket, ticker: str):
+        """Subscribe to orderbook updates for a specific ticker"""
+        subscription = {
+            "id": self.message_id,
+            "cmd": "subscribe",
+            "params": {
+                "channels": ["orderbook_delta"],
+                "market_tickers": [ticker]
+            }
+        }
+        await websocket.send(json.dumps(subscription))
+        self.message_id += 1
+        self.logger.info(f"Subscribed to orderbook updates for {ticker}")
+    
+    async def _unsubscribe_from_ticker(self, websocket, ticker: str):
+        """Unsubscribe from orderbook updates for a specific ticker"""
+        unsubscription = {
+            "id": self.message_id,
+            "cmd": "unsubscribe",
+            "params": {
+                "channels": ["orderbook_delta"],
+                "market_tickers": [ticker]
+            }
+        }
+        await websocket.send(json.dumps(unsubscription))
+        self.message_id += 1
+        self.logger.info(f"Unsubscribed from orderbook updates for {ticker}")
+    
+    async def _process_message(self, message: str):
+        """Process incoming WebSocket messages"""
+        try:
+            data = json.loads(message)
+            msg_type = data.get("type")
+            
+            if msg_type == "subscribed":
+                self.logger.info(f"Orderbook subscription confirmed: {data}")
+                
+            elif msg_type == "orderbook_snapshot":
+                # Process full orderbook snapshot
+                msg_data = data.get("msg", {})
+                self._handle_orderbook_snapshot(msg_data)
+                
+            elif msg_type == "orderbook_delta":
+                # Process orderbook delta (incremental update)
+                msg_data = data.get("msg", {})
+                self._handle_orderbook_delta(msg_data)
+                
+            elif msg_type == "error":
+                error_code = data.get("msg", {}).get("code")
+                error_msg = data.get("msg", {}).get("msg")
+                self.logger.error(f"Orderbook WebSocket error {error_code}: {error_msg}")
+                
+            else:
+                self.logger.debug(f"Received orderbook message type: {msg_type}")
+                
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Failed to parse orderbook WebSocket message: {e}")
+        except Exception as e:
+            self.logger.error(f"Error processing orderbook WebSocket message: {e}")
+    
+    def _handle_orderbook_snapshot(self, msg_data: Dict):
+        """Handle a full orderbook snapshot"""
+        try:
+            self.logger.info(f"Orderbook snapshot: {msg_data}")
+            ticker = msg_data.get("market_ticker")
+            if not ticker:
+                return
+            
+            # Extract best bid and ask from snapshot
+            yes_bids = msg_data.get("yes", [])
+            no_bids = msg_data.get("no", [])
+            
+            # In Kalshi's orderbook:
+            # - yes bids are buyers of YES contracts
+            # - no bids are buyers of NO contracts (which are sellers of YES)
+            # For YES side: best_bid from yes, best_ask from (1.0 - no best bid)
+            
+            best_bid = None
+            best_ask = None
+            
+            if yes_bids and len(yes_bids) > 0:
+                # yes_bids is list of [price, size]
+                best_bid = float(yes_bids[0][0]) / 100.0 if yes_bids[0][0] > 1.0 else float(yes_bids[0][0])
+            
+            if no_bids and len(no_bids) > 0:
+                # no bid price needs to be converted to yes ask
+                no_bid_price = float(no_bids[0][0]) / 100.0 if no_bids[0][0] > 1.0 else float(no_bids[0][0])
+                best_ask = to_tick(1.0 - no_bid_price)
+            
+            # Update orderbook state
+            self.orderbooks[ticker] = {
+                'best_bid': best_bid,
+                'best_ask': best_ask
+            }
+            
+            self.logger.debug(f"Orderbook snapshot for {ticker}: bid={best_bid}, ask={best_ask}")
+            
+            # Trigger callback if both bid and ask are available
+            if best_bid is not None and best_ask is not None:
+                self._trigger_update_callback(ticker, best_bid, best_ask)
+                
+        except Exception as e:
+            self.logger.error(f"Error handling orderbook snapshot: {e}")
+    
+    def _handle_orderbook_delta(self, msg_data: Dict):
+        """Handle an orderbook delta (incremental update)"""
+        try:
+            ticker = msg_data.get("market_ticker")
+            if not ticker:
+                return
+            
+            # Get current orderbook state
+            current_ob = self.orderbooks.get(ticker, {'best_bid': None, 'best_ask': None})
+            
+            # Delta format similar to snapshot
+            yes_bids = msg_data.get("yes", [])
+            no_bids = msg_data.get("no", [])
+            
+            # Update best bid if yes bids changed
+            if yes_bids and len(yes_bids) > 0:
+                best_bid = float(yes_bids[0][0]) / 100.0 if yes_bids[0][0] > 1.0 else float(yes_bids[0][0])
+                current_ob['best_bid'] = best_bid
+            
+            # Update best ask if no bids changed
+            if no_bids and len(no_bids) > 0:
+                no_bid_price = float(no_bids[0][0]) / 100.0 if no_bids[0][0] > 1.0 else float(no_bids[0][0])
+                current_ob['best_ask'] = to_tick(1.0 - no_bid_price)
+            
+            # Update orderbook state
+            self.orderbooks[ticker] = current_ob
+            
+            # Check rate limiting
+            now = time.time()
+            last_update = self.last_update_ts.get(ticker, 0.0)
+            if (now - last_update) * 1000 < self.cooldown_ms:
+                # Still in cooldown, skip callback
+                return
+            
+            # Trigger callback if both bid and ask are available
+            if current_ob['best_bid'] is not None and current_ob['best_ask'] is not None:
+                self.last_update_ts[ticker] = now
+                self._trigger_update_callback(ticker, current_ob['best_bid'], current_ob['best_ask'])
+                
+        except Exception as e:
+            self.logger.error(f"Error handling orderbook delta: {e}")
+    
+    def _trigger_update_callback(self, ticker: str, best_bid: float, best_ask: float):
+        """Trigger the bot's callback for orderbook updates"""
+        if self.bot and hasattr(self.bot, '_handle_orderbook_update'):
+            try:
+                self.bot._handle_orderbook_update(ticker, best_bid, best_ask)
+            except Exception as e:
+                self.logger.error(f"Error in bot._handle_orderbook_update for {ticker}: {e}")
+    
+    async def _handle_reconnect(self):
+        """Handle reconnection with exponential backoff"""
+        self.logger.info(f"Reconnecting orderbook WebSocket in {self.reconnect_delay:.1f} seconds...")
+        await asyncio.sleep(self.reconnect_delay)
+        
+        # Exponential backoff
+        self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
+    
+    def add_market(self, ticker: str):
+        """Add a market to track (subscribe to orderbook updates)"""
+        with self.subscription_lock:
+            if ticker in self.subscribed_tickers:
+                self.logger.debug(f"Already subscribed to {ticker}")
+                return
+            
+            self.subscribed_tickers.add(ticker)
+            self.logger.info(f"Adding market {ticker} to orderbook tracker")
+        
+        # If websocket is connected, subscribe immediately
+        try:
+            if self.ws:
+                ws_status = str(self.ws.state) if hasattr(self.ws, 'state') else "unknown"
+                self.logger.info(f"WebSocket status when adding {ticker}: {ws_status}")
+            else:
+                self.logger.info(f"WebSocket status when adding {ticker}: not initialized")
+        except Exception as e:
+            self.logger.warning(f"Could not check WebSocket status: {e}")
+        
+        if self.ws and hasattr(self.ws, 'state') and self.ws.state == websockets.protocol.State.OPEN:
+            async def subscribe_async():
+                self.logger.info(f"Subscribing to {ticker}")
+                await self._subscribe_to_ticker(self.ws, ticker)
+            
+            # Run in the event loop
+            try:
+                asyncio.run_coroutine_threadsafe(subscribe_async(), self._get_event_loop())
+            except Exception as e:
+                self.logger.warning(f"Failed to subscribe to {ticker} immediately: {e}")
+    
+    def remove_market(self, ticker: str):
+        """Remove a market from tracking (unsubscribe from orderbook updates)"""
+        with self.subscription_lock:
+            if ticker not in self.subscribed_tickers:
+                return
+            
+            self.subscribed_tickers.discard(ticker)
+            self.logger.info(f"Removing market {ticker} from orderbook tracker")
+        
+        # Clean up state
+        self.orderbooks.pop(ticker, None)
+        self.last_update_ts.pop(ticker, None)
+        
+        # If websocket is connected, unsubscribe immediately
+        if self.ws and hasattr(self.ws, 'state') and self.ws.state == websockets.protocol.State.OPEN:
+            async def unsubscribe_async():
+                await self._unsubscribe_from_ticker(self.ws, ticker)
+            
+            # Run in the event loop
+            try:
+                asyncio.run_coroutine_threadsafe(unsubscribe_async(), self._get_event_loop())
+            except Exception as e:
+                self.logger.warning(f"Failed to unsubscribe from {ticker} immediately: {e}")
+    
+    def _get_event_loop(self):
+        """Get the asyncio event loop for this thread"""
+        # This is a helper to get the event loop from the websocket thread
+        # We'll store it when we start the thread
+        return getattr(self, '_event_loop', None)
+    
+    def start(self):
+        """Start the WebSocket connection in a separate thread"""
+        if self.is_running:
+            self.logger.warning("Orderbook WebSocket tracker already running")
+            return
+        
+        self.is_running = True
+        self.stop_event.clear()
+        
+        def run_async_loop():
+            """Run the asyncio event loop in a separate thread"""
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._event_loop = loop  # Store for later use
+            try:
+                loop.run_until_complete(self._connect_and_listen())
+            finally:
+                loop.close()
+        
+        self.ws_thread = threading.Thread(target=run_async_loop, daemon=True)
+        self.ws_thread.start()
+        self.logger.info("Orderbook WebSocket tracker started")
+    
+    def stop(self):
+        """Stop the WebSocket connection"""
+        if not self.is_running:
+            return
+        
+        self.logger.info("Stopping orderbook WebSocket tracker...")
+        self.stop_event.set()
+        self.is_running = False
+        
+        # Wait for thread to finish (with timeout)
+        if self.ws_thread and self.ws_thread.is_alive():
+            self.ws_thread.join(timeout=5.0)
+        
+        self.logger.info("Orderbook WebSocket tracker stopped")
+
+
 class AbstractTradingAPI(abc.ABC):
     @abc.abstractmethod
     def get_price(self, ticker: str) -> Dict[str, float]:
@@ -1098,10 +1485,8 @@ class KalshiTradingAPI(AbstractTradingAPI):
             return {}
 
     def get_price(self, ticker: str) -> Dict[str, float]:
-        self.logger.info("Retrieving market data for market ticker: " + ticker)
         api_response = self.client.get_market(ticker)
         market_obj = getattr(api_response, "market", None) or {}
-        self.logger.info(f"Market object: {getattr(market_obj, 'close_time', None)}")
         yes_bid = float(market_obj.get("yes_bid") if isinstance(market_obj, dict) else getattr(market_obj, "yes_bid", 0)) / 100
         yes_ask = float(market_obj.get("yes_ask") if isinstance(market_obj, dict) else getattr(market_obj, "yes_ask", 0)) / 100
         no_bid = float(market_obj.get("no_bid") if isinstance(market_obj, dict) else getattr(market_obj, "no_bid", 0)) / 100
@@ -1110,8 +1495,6 @@ class KalshiTradingAPI(AbstractTradingAPI):
         yes_mid_price = round((yes_bid + yes_ask) / 2, 2)
         no_mid_price = round((no_bid + no_ask) / 2, 2)
 
-        self.logger.info(f"Current yes mid-market price: ${yes_mid_price:.2f}")
-        self.logger.info(f"Current no mid-market price: ${no_mid_price:.2f}")
         return {"yes": yes_mid_price, "no": no_mid_price}
 
     def get_balance(self):
@@ -1463,7 +1846,6 @@ class KalshiTradingAPI(AbstractTradingAPI):
         return all_items
 
     def get_orders(self, ticker: str) -> List[Dict]:
-        self.logger.info("Retrieving orders...")
         api_response = self.client.get_orders(ticker=ticker, status="resting")
         raw_orders = getattr(api_response, "orders", None)
         if raw_orders is None:
@@ -1552,7 +1934,6 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
             normalized_orders.append(normalized)
 
-        self.logger.info(f"Retrieved {len(normalized_orders)} orders")
         return normalized_orders
 
     def get_all_orders(self) -> List[Dict]:
@@ -1691,11 +2072,7 @@ class KalshiTradingAPI(AbstractTradingAPI):
             reverse = (book_side == "bid")
             ordered = sorted(levels.items(), key=lambda x: x[0], reverse=reverse)
 
-            self.logger.info(f"Ordered: {ordered} for {book_side} on {ticker}")
-
             best_price, best_size = ordered[0]
-
-            self.logger.info(f"Best price: {best_price}, Best size: {best_size} for {ticker}")
 
             if best_size >= target:
                 amount_needed = 0
@@ -1717,7 +2094,6 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
             # Filter out markets that end before 24 hours from now
             end_date = market.get("end_date", "")
-            self.logger.info(f"End date: {end_date}")
             if end_date:
                 try:
                     # Parse ISO date string and convert to timestamp
@@ -1736,7 +2112,6 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
             # Filter out markets where time between start and end is less than 28 hours
             start_date = market.get("start_date", "")
-            self.logger.info(f"Start date: {start_date}")
             if start_date and end_date:
                 try:
                     # Parse ISO date strings and convert to timestamps
@@ -1777,11 +2152,9 @@ class KalshiTradingAPI(AbstractTradingAPI):
             yes_mid = price.get("yes")
             no_mid = price.get("no")
             if yes_mid >= 0.90 or yes_mid <= 0.10:
-                self.logger.info(f"{ticker}: market is resolved; skipping")
                 skip_market = True
             
             if no_mid >= 0.90 or no_mid <= 0.10:
-                self.logger.info(f"{ticker}: market is resolved; skipping")
                 skip_market = True
                 
             if skip_market:
@@ -1860,19 +2233,19 @@ class KalshiTradingAPI(AbstractTradingAPI):
         market_ticker: str,
         start_ts: Optional[int] = None,
         end_ts: Optional[int] = None,
-        period_interval: int = 1
+        period_interval: int = 60  # Valid values: 1 (1 minute), 60 (1 hour), 1440 (1 day)
     ) -> List[Dict]:
         """
-        Fetch candlestick data for a market.
+        Fetch candlestick data for a market by directly calling the Kalshi API.
         
         Args:
             market_ticker: The market ticker
             start_ts: Start timestamp (Unix seconds). If None, defaults to 72 hours ago
             end_ts: End timestamp (Unix seconds). If None, defaults to now
-            period_interval: Interval in minutes (1, 5, 15, 60, etc.)
+            period_interval: Time period length in minutes. Valid values: 1, 60, or 1440
         
         Returns:
-            List of candlestick dicts with keys: open_ts, close_ts, open, high, low, close, volume
+            List of candlestick dicts with keys: end_period_ts, yes_bid, yes_ask, price, volume, open_interest
         """
         try:
             now = int(time.time())
@@ -1881,25 +2254,83 @@ class KalshiTradingAPI(AbstractTradingAPI):
             if end_ts is None:
                 end_ts = now
             
-            # Use the Kalshi SDK method if available
-            response = self.client.get_market_candlesticks(
-                market_ticker=market_ticker,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                period_interval=period_interval
-            )
+            # Extract series ticker from market ticker
+            series_ticker = market_ticker.split("-")[0]
+            
+            # Build the API URL
+            base_url = "https://api.elections.kalshi.com/trade-api/v2"
+            path = f"/series/{series_ticker}/markets/{market_ticker}/candlesticks"
+            url = f"{base_url}{path}"
+            
+            # Build query parameters
+            params = {
+                'start_ts': start_ts,
+                'end_ts': end_ts,
+                'period_interval': period_interval
+            }
+            
+            # Create authentication headers using client's credentials
+            from kalshi_python.api_client import KalshiAuth
+            import tempfile
+            
+            # Write private key to temporary file for KalshiAuth
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.pem') as tmp_key:
+                tmp_key.write(self.client.private_key_pem)
+                tmp_key_path = tmp_key.name
+            
+            try:
+                # Create auth instance and get headers
+                auth = KalshiAuth(self.client.api_key_id, tmp_key_path)
+                auth_headers = auth.create_auth_headers('GET', path)
+            finally:
+                # Clean up temporary file
+                os.unlink(tmp_key_path)
+            
+            # Make the API request
+            self.logger.info(f"Fetching candlesticks: {url}")
+            self.logger.info(f"Params: {params}")
+            
+            response = requests.get(url, headers=auth_headers, params=params)
+            response.raise_for_status()
             
             # Parse response
+            data = response.json()
             candlesticks = []
-            if hasattr(response, 'candlesticks'):
-                for candle in response.candlesticks:
+            
+            if 'candlesticks' in data:
+                for candle in data['candlesticks']:
+                    # Extract price - use close price, or mean, or midpoint of bid/ask
+                    price_dict = candle.get('price', {})
+                    yes_bid_dict = candle.get('yes_bid', {})
+                    yes_ask_dict = candle.get('yes_ask', {})
+                    
+                    # Try to get a single price value (in cents)
+                    price_value = None
+                    if price_dict:
+                        # Prefer close price from actual trades
+                        price_value = price_dict.get('close')
+                        if price_value is None:
+                            # Fall back to mean if available
+                            price_value = price_dict.get('mean')
+                    
+                    # If no trades occurred, use midpoint of bid/ask
+                    if price_value is None:
+                        bid_close = yes_bid_dict.get('close') if yes_bid_dict else None
+                        ask_close = yes_ask_dict.get('close') if yes_ask_dict else None
+                        if bid_close is not None and ask_close is not None:
+                            price_value = (bid_close + ask_close) / 2.0
+                    
+                    # Convert from cents to dollars (0-1 range)
+                    if price_value is not None:
+                        price_value = price_value / 100.0
+                    
                     candlesticks.append({
-                        'end_period_ts': getattr(candle, 'end_period_ts', None),
-                        'yes_bid': getattr(candle, 'yes_bid', None),
-                        'yes_ask': getattr(candle, 'yes_ask', None),
-                        'price': getattr(candle, 'price', None),
-                        'volume': getattr(candle, 'volume', None),
-                        'open_interest': getattr(candle, 'open_interest', None),
+                        'end_period_ts': candle.get('end_period_ts'),
+                        'yes_bid': candle.get('yes_bid'),
+                        'yes_ask': candle.get('yes_ask'),
+                        'price': price_value,  # Now a single float value in [0, 1]
+                        'volume': candle.get('volume'),
+                        'open_interest': candle.get('open_interest'),
                     })
             
             self.logger.debug(f"Fetched {len(candlesticks)} candlesticks for {market_ticker}")
@@ -1907,6 +2338,8 @@ class KalshiTradingAPI(AbstractTradingAPI):
             
         except Exception as e:
             self.logger.warning(f"Failed to fetch candlesticks for {market_ticker}: {e}")
+            import traceback
+            self.logger.warning(f"Traceback: {traceback.format_exc()}")
             return []
             
 
@@ -2016,6 +2449,9 @@ class LIPBot:
         inventory_buy_threshold: float = 0.4,
         max_workers: int = 5,
         _market_end_ts: Optional[Dict[str, float]] = None,
+        max_markets_with_orders: int = 20,
+        discovery_interval_seconds: int = 10,
+        orderbook_update_cooldown_ms: int = 500,
     ):
         self.api = api
         self.logger = logger
@@ -2030,6 +2466,11 @@ class LIPBot:
         self.inventory_buy_threshold = float(inventory_buy_threshold)  # Stop buying when inventory > threshold * max_position
         self.max_workers = max(1, int(max_workers))  # Number of parallel threads for order management
         self._market_end_ts = _market_end_ts or {}
+        
+        # New config parameters for websocket orderbook and discovery
+        self.max_markets_with_orders = max(1, int(max_markets_with_orders))
+        self.discovery_interval_seconds = max(1, int(discovery_interval_seconds))
+        self.orderbook_update_cooldown_ms = max(100, int(orderbook_update_cooldown_ms))
 
         self.toxicity_cooldown_secs = float(os.getenv("LIP_TOXICITY_COOLDOWN", "1800"))  # 30 min
         self._toxic_until: Dict[str, float] = {}  # ticker -> epoch when we can try again
@@ -2098,6 +2539,13 @@ class LIPBot:
         
         # WebSocket fill tracker (will be started when run() is called)
         self.ws_fill_tracker: Optional[WebSocketFillTracker] = None
+        
+        # WebSocket orderbook tracker (will be started when run() is called)
+        self.ws_orderbook_tracker: Optional[WebSocketOrderbookTracker] = None
+        
+        # Discovery queue for background market discovery thread
+        self._discovery_queue = queue.Queue(maxsize=100)
+        self.discovery_thread: Optional[threading.Thread] = None
 
         # How many *new* markets to start per discovery cycle
         self.discovery_max_new = int(os.getenv("LIP_DISCOVERY_MAX_NEW", "8"))
@@ -2110,7 +2558,7 @@ class LIPBot:
         self.lip_discount_factor = float(os.getenv("LIP_DISCOUNT_FACTOR", "0.95"))  # LIP DF for multipliers
         self.lip_risk_threshold = float(os.getenv("LIP_RISK_THRESHOLD", "3.0"))  # Max risk score
         self.lip_risk_alpha = float(os.getenv("LIP_RISK_ALPHA", "1.0"))  # Quote distance scaling
-        self.lip_time_risk_k = float(os.getenv("LIP_TIME_RISK_K", "0.15"))  # Time decay constant
+        self.lip_time_risk_k = float(os.getenv("LIP_TIME_RISK_K", "0.04"))  # Time decay constant for hyperbolic formula
         self.lip_vol_gamma = float(os.getenv("LIP_VOL_GAMMA", "2.0"))  # Volatility scaling factor
         
         self.logger.info(f"LIP risk-based quoting: {'ENABLED' if self.lip_enabled else 'DISABLED'}")
@@ -2234,17 +2682,41 @@ class LIPBot:
         """Refresh per-market LIP target sizes from active incentive programs."""
         try:
             items = self.api.get_liq_markets() or []
+            self.logger.info(f"Refreshing LIP target sizes: found {len(items)} LIP markets")
+            
+            markets_with_targets = 0
             for it in items:
                 tkr = it.get("market_ticker")
                 tsz = it.get("target_size") or 0
                 self._target_sizes[tkr] = int(tsz)
+                
+                if tsz > 0:
+                    markets_with_targets += 1
+                    self.logger.debug(f"  {tkr}: target={tsz}")
 
                 end_raw = it.get("end_date", None)
                 if end_raw is not None:
-                    end_ts = float(end_raw)
-                    if end_ts > 1e12:
-                        end_ts = end_ts / 1000.0
-                    self._market_end_ts[tkr] = end_ts
+                    try:
+                        # Handle ISO 8601 string timestamps (e.g., '2025-12-15T04:59:00Z')
+                        if isinstance(end_raw, str):
+                            # Replace 'Z' with '+00:00' for fromisoformat compatibility
+                            timestamp_str = end_raw.replace('Z', '+00:00')
+                            dt = datetime.fromisoformat(timestamp_str)
+                            end_ts = dt.timestamp()
+                        else:
+                            # Fallback for numeric timestamps
+                            end_ts = float(end_raw)
+                            if end_ts > 1e12:
+                                end_ts = end_ts / 1000.0
+                        self._market_end_ts[tkr] = end_ts
+                    except (ValueError, TypeError) as e:
+                        self.logger.debug(f"Could not parse end_date for {tkr}: {end_raw} ({e})")
+            
+            self.logger.info(f"LIP markets with non-zero targets: {markets_with_targets}/{len(items)}")
+            
+            if len(items) > 0 and markets_with_targets == 0:
+                self.logger.warning("All LIP markets have target_size=0! LIP risk-based quoting won't be used.")
+                self.logger.warning("The bot will fall back to standard quoting logic.")
         except Exception as e:
             self.logger.warning(f"Target-size refresh failed: {e}")
 
@@ -2274,6 +2746,7 @@ class LIPBot:
         for ticker in candidate_tickers:
             try:
                 vol = self.compute_volatility_risk(ticker, lookback_hours=48, ewma_alpha=0.3)
+                self.logger.info(f"Volatility for {ticker}: {vol}")
                 vol_map[ticker] = vol
             except Exception as e:
                 self.logger.warning(f"Failed to compute volatility for {ticker}: {e}")
@@ -2448,15 +2921,25 @@ class LIPBot:
     def compute_time_risk(
         self,
         ticker: str,
-        k: float = 0.15
+        k: float = 0.04
     ) -> float:
         """
-        Compute time risk using exponential decay.
+        Compute time risk using hyperbolic decay: 1 / (1 + k * hours).
+        
+        This provides better distribution across typical market durations (with k=0.04):
+        - 1h → 0.96
+        - 3h → 0.89
+        - 6h → 0.81
+        - 12h → 0.68
+        - 24h → 0.51
+        - 48h → 0.34
+        - 7 days (168h) → 0.13
+        - 30 days → 0.03
         
         Args:
             ticker: Market ticker
             k: Decay constant (higher = faster decay with time)
-               k ~ 0.15 gives TimeRisk ~ 0.2 at 24h, ~ 0.8 at 3h
+               k=0.04 gives good spread: ~0.5 at 24h, ~0.34 at 48h, ~0.13 at 7 days
         
         Returns:
             TimeRisk in [0, 1], where higher = closer to expiry (riskier)
@@ -2466,11 +2949,14 @@ class LIPBot:
             # Unknown expiry - assume moderate risk
             return 0.5
         
-        # exp(-k * hours) is near 1 for small hours, near 0 for large hours
-        time_risk = math.exp(-k * hours)
+        # Hyperbolic decay: 1 / (1 + k * hours)
+        # This decays more gradually than exponential, giving better distribution
+        time_risk = 1.0 / (1.0 + k * hours)
         
-        # Clamp to ensure it doesn't collapse to exactly 0
+        # Clamp to reasonable bounds (should rarely hit these)
         time_risk = max(0.01, min(1.0, time_risk))
+        
+        self.logger.debug(f"{ticker}: hours_to_expiry={hours:.1f}h, time_risk={time_risk:.3f}")
         
         return time_risk
 
@@ -2496,12 +2982,12 @@ class LIPBot:
             now = int(time.time())
             start_ts = now - (lookback_hours * 3600)
             
-            # Fetch candlesticks (5-minute intervals for decent granularity)
+            # Fetch candlesticks (1-minute intervals for decent granularity)
             candlesticks = self.api.get_candlesticks(
                 market_ticker=ticker,
                 start_ts=start_ts,
                 end_ts=now,
-                period_interval=5
+                period_interval=1  # 1 minute intervals
             )
             
             if len(candlesticks) < 3:
@@ -2555,7 +3041,12 @@ class LIPBot:
         use_cached_percentiles: bool = True
     ) -> float:
         """
-        Compute combined risk score = TimeRisk × VolFactor.
+        Compute combined risk score = TimeRisk × VolFactor × 5.0 (scaling factor).
+        
+        The scaling factor of 5.0 ensures risk scores are in a meaningful range
+        (roughly 0.5 to 15.0) that works well with the default thresholds:
+        - Medium risk threshold: 1.5
+        - High risk threshold: 2.5
         
         Args:
             ticker: Market ticker
@@ -2566,6 +3057,7 @@ class LIPBot:
         
         Returns:
             risk_score: Combined risk metric. Higher = riskier.
+                       Typical range: 0.5 (low time risk, low vol) to 15.0 (high time risk, high vol)
         """
         time_risk = self.compute_time_risk(ticker, k=self.lip_time_risk_k)
         
@@ -2595,7 +3087,13 @@ class LIPBot:
         
         vol_factor = 1.0 + gamma * vol_score
         
-        risk_score = time_risk * vol_factor
+        # Scale by 5.0 to get risk scores in a meaningful range for the default thresholds
+        risk_score = time_risk * vol_factor * 5.0
+        
+        self.logger.debug(
+            f"{ticker}: time_risk={time_risk:.3f}, vol_score={vol_score:.3f}, "
+            f"vol_factor={vol_factor:.2f}, risk_score={risk_score:.3f}"
+        )
         
         return risk_score
 
@@ -2611,10 +3109,15 @@ class LIPBot:
         """
         Determine which level in the qualifying band to quote at.
         
+        Uses discrete risk buckets:
+        - Low risk: Join the touch (ticks=0)
+        - Medium risk: One tick behind (ticks=1)
+        - High risk: Should be filtered out before calling this
+        
         Args:
-            qualifying_band: The qualifying band from build_qualifying_band
+            qualifying_band: The qualifying band with ticks_from_best ranging from 0 to max_levels
             risk_score: The combined risk score for this market
-            alpha: Scaling parameter (max_ticks = floor(alpha * risk_score))
+            alpha: Unused (kept for compatibility)
             inventory: Current inventory (positive = long)
             max_position: Maximum allowed position
             is_bid: True if quoting on bid side, False for ask side
@@ -2625,12 +3128,16 @@ class LIPBot:
         if not qualifying_band:
             return None
         
-        # Compute allowed distance from top based on risk
-        max_ticks = int(math.floor(alpha * risk_score))
+        # Get risk thresholds from environment
+        medium_risk_threshold = float(os.getenv("LIP_MEDIUM_RISK_THRESHOLD", "1.5"))
         
-        # Respect the LIP band limits
-        max_qual_ticks = max(level['ticks_from_best'] for level in qualifying_band)
-        max_ticks = min(max_ticks, max_qual_ticks)
+        # Determine base target based on risk bucket
+        if risk_score < medium_risk_threshold:
+            # Low risk: sit at touch
+            target_ticks = 0
+        else:
+            # Medium risk: one tick behind
+            target_ticks = 1
         
         # Apply inventory skew: if we're long, back off from bidding aggressively
         # if we're short, back off from asking aggressively
@@ -2638,27 +3145,20 @@ class LIPBot:
         
         if is_bid and inventory > 0:
             # Long inventory: less aggressive on bids (sit further back)
-            max_ticks = int(max_ticks + inventory_factor * 2)
+            target_ticks = int(target_ticks + inventory_factor * 2)
         elif not is_bid and inventory < 0:
             # Short inventory: less aggressive on asks
-            max_ticks = int(max_ticks + inventory_factor * 2)
+            target_ticks = int(target_ticks + inventory_factor * 2)
         
-        # Re-clamp to qualifying band
-        max_ticks = min(max_ticks, max_qual_ticks)
+        # Clamp to valid range
+        max_qual_ticks = max(level['ticks_from_best'] for level in qualifying_band)
+        target_ticks = min(target_ticks, max_qual_ticks)
         
-        # Filter to levels within allowed distance
-        eligible_levels = [
-            level for level in qualifying_band
-            if level['ticks_from_best'] <= max_ticks
-        ]
-        
-        if not eligible_levels:
-            # Fall back to furthest qualifying level
-            return qualifying_band[-1]
-        
-        # Default: choose the level closest to top (best multiplier)
-        # This is the first eligible level (ticks_from_best is smallest)
-        chosen_level = min(eligible_levels, key=lambda x: x['ticks_from_best'])
+        # Choose the level closest to our target
+        chosen_level = min(
+            qualifying_band, 
+            key=lambda x: abs(x['ticks_from_best'] - target_ticks)
+        )
         
         return chosen_level
 
@@ -2719,6 +3219,82 @@ class LIPBot:
 
         self._markout_checks = remaining
 
+    def _run_market_discovery(self):
+        """
+        Background thread that continuously discovers new markets and queues them for processing.
+        Runs in a separate daemon thread to avoid blocking the main trading loop.
+        """
+        self.logger.info("Market discovery thread started")
+        
+        discovery_interval = getattr(self, 'discovery_interval_seconds', 10)
+        
+        while not self._should_stop():
+            try:
+                start_time = time.time()
+                
+                # Fetch valid markets from API
+                try:
+                    valid_markets = self.api.get_valid_markets() or []
+                    valid_markets.sort(key=lambda x: x.get('score', 0), reverse=True)
+                    self.logger.info(f"[DISCOVERY] Found {len(valid_markets)} valid markets")
+                except Exception as e:
+                    self.logger.warning(f"[DISCOVERY] Market discovery API call failed: {e}")
+                    # Sleep and retry
+                    time.sleep(discovery_interval)
+                    continue
+                
+                # Filter and queue markets
+                for entry in valid_markets:
+                    if self._should_stop():
+                        break
+                    
+                    ticker = entry.get('ticker')
+                    if not ticker:
+                        continue
+                    
+                    # Skip if already being tracked (check if in discovery queue would be redundant)
+                    # The main loop will check if it's already tracked
+                    
+                    # Skip historically toxic markets
+                    ema = self._markout_ema.get(ticker)
+                    if ema is not None and ema <= (self.mo_bad_threshold * 3.0):
+                        self.logger.debug(f"[DISCOVERY] Skipping {ticker}: historically toxic (EMA={ema:.4f})")
+                        continue
+                    
+                    # Store end date if available
+                    end_raw = entry.get('end_date', None)
+                    if end_raw is not None:
+                        end_ts = float(end_raw)
+                        if end_ts > 1e12:
+                            end_ts = end_ts / 1000.0
+                        self._market_end_ts[ticker] = end_ts
+                    
+                    # Convert NO side entries to YES side (we only manage YES)
+                    entry_side = entry.get('side')
+                    if entry_side == 'no':
+                        entry = dict(entry)
+                        entry['side'] = 'yes'
+                        if entry.get('best_price') is not None:
+                            entry['best_price'] = to_tick(1.0 - float(entry['best_price']))
+                    
+                    # Add to discovery queue (non-blocking)
+                    try:
+                        self._discovery_queue.put_nowait(entry)
+                    except Exception:
+                        # Queue is full, skip this market
+                        pass
+                
+                # Sleep for the configured interval
+                elapsed = time.time() - start_time
+                sleep_time = max(0.1, discovery_interval - elapsed)
+                time.sleep(sleep_time)
+                
+            except Exception as e:
+                self.logger.error(f"[DISCOVERY] Error in discovery thread: {e}")
+                time.sleep(discovery_interval)
+        
+        self.logger.info("Market discovery thread stopped")
+
     def _process_single_market(self, ticker: str, orders_by_ticker: Dict[str, List[Dict]]) -> None:
         """
         Process order management for a single market.
@@ -2743,6 +3319,22 @@ class LIPBot:
             except Exception as e:
                 self.logger.warning(f"Failed to get position for {ticker}: {e}")
                 inventory = 0
+            
+            # Auto-subscribe to orderbook websocket when we have inventory
+            if self.ws_orderbook_tracker:
+                if inventory > 0:
+                    # Subscribe if we have inventory
+                    try:
+                        self.logger.info(f"Adding {ticker} to orderbook tracker")
+                        self.ws_orderbook_tracker.add_market(ticker)
+                    except Exception as e:
+                        self.logger.debug(f"Failed to add {ticker} to orderbook tracker: {e}")
+                else:
+                    # Unsubscribe if inventory is 0
+                    try:
+                        self.ws_orderbook_tracker.remove_market(ticker)
+                    except Exception as e:
+                        self.logger.debug(f"Failed to remove {ticker} from orderbook tracker: {e}")
 
             hrs = self._hours_to_expiry(ticker)
             soft = 48
@@ -2812,7 +3404,6 @@ class LIPBot:
             if orderbook and self.thin_book(orderbook, min_lvl_size=200, levels=2):
                 self.logger.info(f"{ticker}: thin book detected → shrink size / widen or skip")
                 return
-
             
             prev_touch = self._last_touch.get(ticker)
             is_fast = self.fast_move(prev_touch, (mkt_bid, mkt_ask))
@@ -2895,35 +3486,6 @@ class LIPBot:
                 if self.improve_once_per_touch:
                     allow_improvement = (not self._improved_on_touch.get(key, False)) and cooldown_ok
 
-            if target and target > 0:
-                # In your normalization: YES bids = var_true, YES asks = 1 - var_false
-                yes_bids = [(to_tick(p), sz) for (p, sz) in (orderbook.get("var_true") or [])]
-                yes_asks = [(to_tick(1.0 - p), sz) for (p, sz) in (orderbook.get("var_false") or [])]
-
-                best_bid_size = self._best_level_size(yes_bids, bid_side=True)
-                best_ask_size = self._best_level_size(yes_asks, bid_side=False)
-
-                if best_bid_size >= target:
-                    self.logger.info(f"{ticker}: LIP target met in _process_single_market (best_bid_size={best_bid_size} >= target={target})")
-                    block_bid_for_lip = True
-                    # Cancel all buy orders since target is met
-                    for o in self.api.get_orders(ticker) or []:
-                        if o.get("side") == "yes" and o.get("action") == "buy":
-                            try:
-                                self.api.cancel_order(o["order_id"])
-                                self.logger.info(f"{ticker}: Canceled buy order {o['order_id']} due to LIP target met")
-                            except Exception as e:
-                                self.logger.error(f"{ticker}: Failed to cancel buy order {o['order_id']}: {e}")
-                    
-                    # If we have no inventory, we should exit this market entirely
-                    if inventory == 0:
-                        self.logger.info(f"{ticker}: LIP target met and flat position → untracking market")
-                        return {"ticker": ticker, "untrack": True}
-                    else:
-                        # We have inventory, so we still need to manage exit orders but no new bids
-                        self.logger.info(f"{ticker}: LIP target met but have inventory={inventory} → will only place exit orders")
-                        # Continue to allow_ask management but ensure no bids are placed
-
             fair = self.compute_fair(orderbook)
             if fair is None:
                 self.logger.warning(f"Failed to compute fair price for {ticker}")
@@ -2941,11 +3503,70 @@ class LIPBot:
             edge_min = 0.01 + float(self._edge_bonus.get(ticker, 0.0) or 0.0)
             min_width_local = max(self.min_quote_width, float(self._width_bonus.get(ticker, 0.0) or 0.0))
 
-            bid, ask = self.compute_quotes(mkt_bid, mkt_ask, inventory, allow_improvement=allow_improvement, min_width=min_width_local, block_bid_for_lip=block_bid_for_lip)
+            # Use LIP risk-adjusted quoting if enabled and target exists
+            if self.lip_enabled and target and target > 0 and orderbook:
+                try:
+                    lip_result = self.compute_lip_adjusted_quotes(
+                        ticker=ticker,
+                        orderbook=orderbook,
+                        target_size=target,
+                        inventory=inventory,
+                        discount_factor=self.lip_discount_factor,
+                        risk_threshold=self.lip_risk_threshold,
+                        alpha=self.lip_risk_alpha
+                    )
 
-            # add edge calculation with adaptive edge_min
-            allow_bid = (fair - bid) >= edge_min
-            allow_ask = (inventory > 0)
+                    
+                    if lip_result['skip_reason']:
+                        self.logger.info(f"{ticker}: LIP skip - {lip_result['skip_reason']}")
+                        # Cancel orders and potentially untrack
+                        for o in self.api.get_orders(ticker) or []:
+                            try:
+                                self.api.cancel_order(o["order_id"])
+                            except Exception:
+                                pass
+                        if inventory == 0:
+                            return {"ticker": ticker, "untrack": True}
+                        else:
+                            # Still manage exit for inventory
+                            bid, ask = self.compute_quotes(mkt_bid, mkt_ask, inventory, allow_improvement=allow_improvement, min_width=min_width_local, block_bid_for_lip=True)
+                            allow_bid = False
+                            allow_ask = True
+                    else:
+                        # Use LIP-computed quotes
+                        bid = lip_result['bid_price'] if lip_result['bid_price'] else mkt_bid
+                        ask = lip_result['ask_price'] if lip_result['ask_price'] else mkt_ask
+                        
+                        # If we have inventory and spread is wide, step in from touch based on spread width
+                        if inventory > 0 and ask is not None:
+                            if spread > 0.07:
+                                ask = to_tick(mkt_ask - 0.02)
+                            elif spread > 0.03:
+                                ask = to_tick(mkt_ask - 0.01)
+                        
+                        # Log LIP metrics
+                        self.logger.info(
+                            f"{ticker}: LIP quotes - bid ${bid:.2f}, ask ${ask:.2f}, "
+                            f"risk_score={lip_result['risk_score']:.2f}, "
+                            f"intensity_bid={lip_result['lip_intensity_bid']:.2f}"
+                        )
+                        
+                        # LIP already determined optimal prices, use edge check
+                        allow_bid = (fair - bid) >= edge_min and lip_result['bid_price'] is not None
+                        # Always allow selling when we have inventory to exit, regardless of LIP
+                        allow_ask = (inventory > 0)
+                        
+                except Exception as e:
+                    self.logger.warning(f"{ticker}: LIP quote computation failed: {e}, falling back to standard")
+                    bid, ask = self.compute_quotes(mkt_bid, mkt_ask, inventory, allow_improvement=allow_improvement, min_width=min_width_local, block_bid_for_lip=block_bid_for_lip)
+                    allow_bid = (fair - bid) >= edge_min
+                    allow_ask = (inventory > 0)
+            else:
+                # Standard quoting (no LIP or no target)
+                bid, ask = self.compute_quotes(mkt_bid, mkt_ask, inventory, allow_improvement=allow_improvement, min_width=min_width_local, block_bid_for_lip=block_bid_for_lip)
+                # add edge calculation with adaptive edge_min
+                allow_bid = (fair - bid) >= edge_min
+                allow_ask = (inventory > 0)
 
             if expiry_mode == "soft":
                 # scale down size later (we’ll handle in manage_orders) and
@@ -3062,15 +3683,37 @@ class LIPBot:
                 self.ws_fill_tracker.start()
                 self.logger.info("WebSocket fill tracker initialized and started")
             
+            # Start WebSocket orderbook tracker
+            if self.ws_orderbook_tracker is None:
+                self.ws_orderbook_tracker = WebSocketOrderbookTracker(
+                    logger=self.logger,
+                    bot=self,
+                    stop_event=self.stop_event,
+                    cooldown_ms=self.orderbook_update_cooldown_ms
+                )
+                self.ws_orderbook_tracker.start()
+                self.logger.info("WebSocket orderbook tracker initialized and started")
+            
+            # Start background market discovery thread
+            if self.discovery_thread is None:
+                self.discovery_thread = threading.Thread(
+                    target=self._run_market_discovery,
+                    daemon=True,
+                    name="MarketDiscovery"
+                )
+                self.discovery_thread.start()
+                self.logger.info("Market discovery thread started")
+            
             # Track markets we have activity in
             tracked_markets: Dict[str, Dict[str, bool]] = {}
-            last_discovery_ts: float = 0.0
             last_pnl_check_ts: float = 0.0
 
             while not self._should_stop():
                 loop_start = time.time()
                 now_ts = time.time()
+
                 if (now_ts - self._last_target_refresh_ts) >= self._target_refresh_interval:
+                    self.logger.info(f"Refreshing LIP target sizes")
                     self._refresh_target_sizes()
                     self._last_target_refresh_ts = now_ts
                 
@@ -3129,7 +3772,6 @@ class LIPBot:
                     if hasattr(self.api, 'get_all_positions'):
                         all_positions = self.api.get_all_positions() or {}
                         for ticker, position in all_positions.items():
-                            self.logger.info(f"Ticker: {ticker}, Position: {position}")
                             # Only add if we have a non-zero position (positive = yes, negative = no) and it's not in my_positions
                             if position != 0 and ticker not in self.my_positions:
                                 # Only track YES side to avoid duplicate positions
@@ -3166,138 +3808,177 @@ class LIPBot:
                     
                     self.logger.info(f"Processed {len(tickers_to_process)} markets in parallel with {self.max_workers} workers")
 
-                # 2) Periodically discover new markets to enter
-                if (time.time() - last_discovery_ts) >= max(1.0, dt):
-                    self.logger.info(f"Discovering new markets")
+                # 2) Pull new markets from discovery queue (populated by background thread)
+                # Count markets with buy orders to enforce max_markets_with_orders limit
+                markets_with_buy_orders = set()
+                for tkr, orders in orders_by_ticker.items():
+                    has_buy_order = any(
+                        o.get("side") == "yes" and o.get("action") == "buy" 
+                        for o in orders
+                    )
+                    if has_buy_order:
+                        markets_with_buy_orders.add(tkr)
+                
+                self.logger.debug(
+                    f"Current markets with buy orders: {len(markets_with_buy_orders)}/{self.max_markets_with_orders}"
+                )
+                
+                # Pull from discovery queue (non-blocking)
+                added = 0
+                processed_from_queue = 0
+                
+                while added < self.discovery_max_new and len(markets_with_buy_orders) < self.max_markets_with_orders:
                     try:
-                        valid_markets = self.api.get_valid_markets() or []
-                        valid_markets.sort(key=lambda x: x.get('score', 0), reverse=True)
-                        self.logger.info(f"Valid markets: {valid_markets}")
-                    except Exception as e:
-                        self.logger.warning(f"Market discovery failed: {e}")
-                        valid_markets = []
-
-                    # Try the top few candidates not currently tracked
-                    # Only consider YES side entries (to avoid duplicate positions)
-                    added = 0
-                    scanned = 0
-
-                    for entry in valid_markets:
-                        if scanned >= self.discovery_scan_cap or added >= self.discovery_max_new:
-                            break
-                        scanned += 1
-
-
-                        tkr = entry.get('ticker')
-                        entry_side = entry.get('side')
-                        end_raw = entry.get('end_date', None)
-                        ema = self._markout_ema.get(tkr)
-                        if ema is not None and ema <= (self.mo_bad_threshold * 3.0):
-                            self.logger.info(f"[DISCOVERY] Skipping {tkr}: historically toxic (EMA={ema:.4f})")
+                        # Non-blocking get from queue
+                        entry = self._discovery_queue.get_nowait()
+                        processed_from_queue += 1
+                    except queue.Empty:
+                        # No more markets in queue
+                        break
+                    
+                    tkr = entry.get('ticker')
+                    if not tkr:
+                        continue
+                    
+                    # Skip if already tracked
+                    if tkr in orders_by_ticker:
+                        self.logger.debug(f"[DISCOVERY] Skipping {tkr}: already have orders")
+                        continue
+                    
+                    # Skip if already tracked in tracked_markets
+                    if tkr in tracked_markets:
+                        self.logger.debug(f"[DISCOVERY] Skipping {tkr}: already tracked")
+                        continue
+                    
+                    # Process this market entry
+                    side = "yes"  # We only manage YES side
+                    try:
+                        self.logger.info(f"[DISCOVERY] Processing {tkr} from queue")
+                        touch = self.api.get_touch(tkr)
+                        if side not in touch:
+                            self.logger.info(f"[DISCOVERY] No touch for market: {tkr}")
                             continue
-                        if end_raw is not None:
-                            end_ts = float(end_raw)
-                            if end_ts > 1e12:
-                                end_ts = end_ts / 1000.0
-                            self._market_end_ts[tkr] = end_ts
-                        if not tkr:
-                            self.logger.info(f"No ticker for market: {entry}")
-                            continue
-                        # Skip NO side entries - we only manage YES side
-                        if entry_side == 'no':
-                            self.logger.info(f"No side for market: {entry}")
-                            entry = dict(entry)
-                            entry['side'] = 'yes'
-                            if entry.get('best_price') is not None:
-                                entry['best_price'] = to_tick(1.0 - float(entry['best_price']))
-
-                        if tkr in orders_by_ticker:
-                            self.logger.info(f"Already have orders for market: {entry}")
-                            continue  # already have orders
-                        # attempt to start managing this market (YES side only)
-                        side = "yes"
+                        mkt_bid, mkt_ask = touch[side]
+                        self.logger.info(f"Mkt bid: {mkt_bid}, Mkt ask: {mkt_ask}")
+                        inventory = self.api.get_position(tkr)
+                        spread = max(0.0, (mkt_ask - mkt_bid))
+                        self.logger.info(f"Spread: {spread}")
+                        key = (tkr, side)
+                        self._last_external_touch.setdefault(key, (to_tick(mkt_bid), to_tick(mkt_ask)))
+                        self._improved_on_touch.setdefault(key, False)
+                        now_ts = time.time()
+                        cooldown_ok = (self.improve_cooldown_seconds <= 0) or (now_ts - self._last_improve_ts.get(key, 0.0) >= self.improve_cooldown_seconds)
+                        allow_improvement = True
+                        if self.improve_once_per_touch:
+                            allow_improvement = (not self._improved_on_touch.get(key, False)) and cooldown_ok
+                        orderbook = {}
                         try:
-                            self.logger.info(f"Getting touch for market: {tkr}")
-                            touch = self.api.get_touch(tkr)
-                            if side not in touch:
-                                self.logger.info(f"No touch for market: {entry}")
-                                continue
-                            mkt_bid, mkt_ask = touch[side]
-                            self.logger.info(f"Mkt bid: {mkt_bid}, Mkt ask: {mkt_ask}")
-                            inventory = self.api.get_position(tkr)
-                            spread = max(0.0, (mkt_ask - mkt_bid))
-                            # no orders yet; treat external touch as the live touch
-                            self.logger.info(f"Spread: {spread}")
-                            key = (tkr, side)
-                            self._last_external_touch.setdefault(key, (to_tick(mkt_bid), to_tick(mkt_ask)))
-                            self._improved_on_touch.setdefault(key, False)
-                            now_ts = time.time()
-                            cooldown_ok = (self.improve_cooldown_seconds <= 0) or (now_ts - self._last_improve_ts.get(key, 0.0) >= self.improve_cooldown_seconds)
-                            allow_improvement = True
-                            if self.improve_once_per_touch:
-                                allow_improvement = (not self._improved_on_touch.get(key, False)) and cooldown_ok
+                            orderbook = self.api.get_orderbook(tkr)
+                        except Exception as e:
+                            self.logger.warning(f"Failed to get orderbook for {tkr}: {e}")
                             orderbook = {}
+                        
+                        target = self._target_sizes.get(tkr)
+                        self.logger.info(f"Target size for {tkr}: {target}")
+                        block_bid_for_lip = False
+
+                        if target and target > 0:
+                            # In your normalization: YES bids = var_true, YES asks = 1 - var_false
+                            yes_bids = [(to_tick(p), sz) for (p, sz) in (orderbook.get("var_true") or [])]
+                            yes_asks = [(to_tick(1.0 - p), sz) for (p, sz) in (orderbook.get("var_false") or [])]
+
+                            best_bid_size = self._best_level_size(yes_bids, bid_side=True)
+                            best_ask_size = self._best_level_size(yes_asks, bid_side=False)
+
+                            if best_bid_size >= target:
+                                self.logger.info(f"Best bid size {best_bid_size} >= target {target} for {tkr}")
+                                block_bid_for_lip = True
+                                for o in self.api.get_orders(tkr) or []:
+                                    if o.get("side") == "yes" and o.get("action") == "buy":
+                                        self.api.cancel_order(o["order_id"])
+                                self.logger.info(f"[DISCOVERY] Skipping {tkr}: LIP target met at best")
+                                continue 
+
+                        #todo change to bias towards markets ending later
+                        fair = self.compute_fair(orderbook)
+                        if fair is None:
+                            self.logger.warning(f"Failed to compute fair price for {tkr}")
+                            continue
+                        EDGE_MIN = 0.01
+                        
+                        # Use LIP risk-adjusted quoting if enabled
+                        if self.lip_enabled and target and target > 0 and orderbook:
                             try:
-                                orderbook = self.api.get_orderbook(tkr)
+                                lip_result = self.compute_lip_adjusted_quotes(
+                                    ticker=tkr,
+                                    orderbook=orderbook,
+                                    target_size=target,
+                                    inventory=inventory,
+                                    discount_factor=self.lip_discount_factor,
+                                    risk_threshold=self.lip_risk_threshold,
+                                    alpha=self.lip_risk_alpha
+                                )
+                                
+                                if lip_result['skip_reason']:
+                                    self.logger.info(f"[DISCOVERY] Skipping {tkr}: {lip_result['skip_reason']}")
+                                    continue
+                                
+                                # Use LIP-computed quotes
+                                bid = lip_result['bid_price'] if lip_result['bid_price'] else mkt_bid
+                                ask = lip_result['ask_price'] if lip_result['ask_price'] else mkt_ask
+                                
+                                # If we have inventory and spread is wide, step in from touch based on spread width
+                                if inventory > 0 and ask is not None:
+                                    if spread > 0.07:
+                                        ask = to_tick(mkt_ask - 0.02)
+                                    elif spread > 0.03:
+                                        ask = to_tick(mkt_ask - 0.01)
+                                
+                                # Log LIP metrics for discovery
+                                self.logger.info(
+                                    f"[DISCOVERY] {tkr}: LIP quotes - bid ${bid:.2f}, ask ${ask:.2f}, "
+                                    f"risk_score={lip_result['risk_score']:.2f}, "
+                                    f"intensity={lip_result['lip_intensity_bid']:.2f}"
+                                )
+                                
+                                # LIP already determined optimal prices
+                                allow_bid = (fair - bid) >= EDGE_MIN and lip_result['bid_price'] is not None
+                                # Always allow selling when we have inventory to exit, regardless of LIP
+                                allow_ask = (inventory > 0)
+                                
                             except Exception as e:
-                                self.logger.warning(f"Failed to get orderbook for {tkr}: {e}")
-                                orderbook = {}
-                            
-                            target = self._target_sizes.get(tkr)
-                            self.logger.info(f"Target size for {tkr}: {target}")
-                            block_bid_for_lip = False
-
-                            if target and target > 0:
-                                # In your normalization: YES bids = var_true, YES asks = 1 - var_false
-                                yes_bids = [(to_tick(p), sz) for (p, sz) in (orderbook.get("var_true") or [])]
-                                yes_asks = [(to_tick(1.0 - p), sz) for (p, sz) in (orderbook.get("var_false") or [])]
-
-                                best_bid_size = self._best_level_size(yes_bids, bid_side=True)
-                                best_ask_size = self._best_level_size(yes_asks, bid_side=False)
-
-                                if best_bid_size >= target:
-                                    self.logger.info(f"Best bid size {best_bid_size} >= target {target} for {tkr}")
-                                    block_bid_for_lip = True
-                                    for o in self.api.get_orders(tkr) or []:
-                                        if o.get("side") == "yes" and o.get("action") == "buy":
-                                            self.api.cancel_order(o["order_id"])
-                                    self.logger.info(f"[DISCOVERY] Skipping {tkr}: LIP target met at best")
-                                    continue 
-
-                            #todo change to bias towards markets ending later
-                            fair = self.compute_fair(orderbook)
-                            if fair is None:
-                                self.logger.warning(f"Failed to compute fair price for {tkr}")
-                                continue
-                            EDGE_MIN = 0.01
+                                self.logger.warning(f"[DISCOVERY] {tkr}: LIP failed: {e}, using standard quotes")
+                                bid, ask = self.compute_quotes(mkt_bid, mkt_ask, inventory, allow_improvement=allow_improvement, min_width=self.min_quote_width, block_bid_for_lip=block_bid_for_lip)
+                                allow_bid = (fair - bid) >= EDGE_MIN
+                                allow_ask = (inventory > 0)
+                                if block_bid_for_lip:
+                                    allow_bid = False
+                        else:
+                            # Standard quoting
                             bid, ask = self.compute_quotes(mkt_bid, mkt_ask, inventory, allow_improvement=allow_improvement, min_width=self.min_quote_width, block_bid_for_lip=block_bid_for_lip)
                             allow_bid = (fair - bid) >= EDGE_MIN
                             allow_ask = (inventory > 0)
-
                             if block_bid_for_lip:
                                 allow_bid = False
-                            
-                            if inventory == 0 and (not allow_bid) and (not allow_ask):
-                                self.logger.info(f"[DISCOVERY] Skipping {tkr}: LIP target met at best; no scoring opportunity.")
-                                continue
+                        
+                        if inventory == 0 and (not allow_bid) and (not allow_ask):
+                            self.logger.info(f"[DISCOVERY] Skipping {tkr}: No profitable opportunities available")
+                            continue
 
-                            self.manage_orders(bid, ask, spread, tkr, inventory, side, allow_bid=allow_bid, allow_ask=allow_ask)
+                        self.manage_orders(bid, ask, spread, tkr, inventory, side, allow_bid=allow_bid, allow_ask=allow_ask)
 
-                            if allow_improvement and inventory == 0 and spread >= 0.02:
-                                self._improved_on_touch[key] = True
-                                self._last_improve_ts[key] = now_ts
-                            tracked_markets.setdefault(tkr, {})[side] = True
-                            added += 1
-                            self.logger.info(f"Started tracking market {tkr} [YES only - avoiding duplicate positions]")
-                        except Exception as e:
-                            self.logger.warning(f"Failed to initialize market {tkr}: {e}")
+                        if allow_improvement and inventory == 0 and spread >= 0.02:
+                            self._improved_on_touch[key] = True
+                            self._last_improve_ts[key] = now_ts
+                        tracked_markets.setdefault(tkr, {})[side] = True
+                        markets_with_buy_orders.add(tkr)  # Update count
+                        added += 1
+                        self.logger.info(f"Started tracking market {tkr} [YES only - avoiding duplicate positions]")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to initialize market {tkr}: {e}")
 
-
-                    if added == 0:
-                        self.logger.info("[DISCOVERY] No eligible markets found this cycle "
-                     f"(scanned={scanned}, cap={self.discovery_scan_cap}).")
-
-                    last_discovery_ts = time.time()
+                if added > 0 or processed_from_queue > 0:
+                    self.logger.info(f"[DISCOVERY] Processed {processed_from_queue} markets from queue, added {added} new markets")
 
                 # 3) Periodically check PnL and inventory imbalance
                 if (time.time() - last_pnl_check_ts) >= 60.0:  # Check every minute
@@ -3457,7 +4138,13 @@ class LIPBot:
             bid = touch_bid
             # Still allow ask modifications for inventory exit
             if inventory > 0:
-                ask = touch_ask  # Use touch for faster exit
+                # Step in from touch based on spread width
+                if spread > 0.07:
+                    ask = to_tick(touch_ask - 0.02)  # Step in 2 ticks for very wide spreads
+                elif spread > 0.03:
+                    ask = to_tick(touch_ask - 0.01)  # Step in 1 tick for wide spreads
+                else:
+                    ask = touch_ask  # Use touch for faster exit
             else:
                 # No inventory and target met - use touch as-is
                 ask = touch_ask
@@ -3466,9 +4153,15 @@ class LIPBot:
         # inventory skew - but don't skew asks when we have inventory (we want to exit at touch)
         bid = to_tick(max(0.02, bid - skew))
         # Only skew ask upward when we DON'T have inventory (normal market making)
-        # When we have inventory, keep ask at the touch for faster exits
+        # When we have inventory, step in from touch based on spread width
         if inventory <= 0:
             ask = to_tick(min(0.98, ask + skew))
+        elif spread > 0.07:
+            # Step in 2 ticks from touch when selling with very wide spread
+            ask = to_tick(touch_ask - 0.02)
+        elif spread > 0.03:
+            # Step in 1 tick from touch when selling with wide spread
+            ask = to_tick(touch_ask - 0.01)
 
         # ensure minimum width
         want_width = max(min_width, 0.0)
@@ -3492,12 +4185,17 @@ class LIPBot:
             # Allow improvement logic for both flat and inventory positions
             if allow_improvement and spread >= 0.04:
                 bid = min(to_tick(bid + 0.01), to_tick(ask - 0.01))
-                # When we have inventory, tighten the ask to the touch
+                # When we have inventory, step in from touch based on spread width
                 if inventory == 0:
                     ask = max(to_tick(ask - 0.01), to_tick(bid + 0.01))
                 else:
-                    # Keep ask at touch when we have inventory
-                    ask = to_tick(touch_ask)
+                    # Step in from touch when we have inventory and spread is wide
+                    if spread > 0.07:
+                        ask = to_tick(touch_ask - 0.02)
+                    elif spread > 0.03:
+                        ask = to_tick(touch_ask - 0.01)
+                    else:
+                        ask = to_tick(touch_ask)
 
         # re-enforce min width after tweaks
         if (ask - bid) < want_width:
@@ -3541,6 +4239,8 @@ class LIPBot:
                 - lip_intensity_ask: Coverage ratio for asks
                 - skip_reason: Reason for skipping (if applicable)
         """
+        self.logger.debug(f"{ticker}: compute_lip_adjusted_quotes called (target={target_size}, inventory={inventory})")
+        
         result = {
             'bid_price': None,
             'ask_price': None,
@@ -3560,6 +4260,27 @@ class LIPBot:
         yes_bids = sorted(yes_bids, key=lambda x: x[0], reverse=True)
         yes_asks = sorted(yes_asks, key=lambda x: x[0])
         
+        # Extract actual BBO (best bid/offer touch prices)
+        if not yes_bids or not yes_asks:
+            result['skip_reason'] = "Empty orderbook"
+            self.logger.info(f"{ticker}: {result['skip_reason']}")
+            return result
+        
+        try:
+            bbo_bid = max(p for p, _ in yes_bids)
+            bbo_ask = min(p for p, _ in yes_asks)
+        except Exception as e:
+            result['skip_reason'] = f"Failed to extract BBO: {e}"
+            self.logger.info(f"{ticker}: {result['skip_reason']}")
+            return result
+        
+        # Check if LIP target is already met at best bid
+        best_bid_size = sum(sz for p, sz in yes_bids if p == bbo_bid)
+        if best_bid_size >= target_size:
+            result['skip_reason'] = f"LIP target already met: best bid size {best_bid_size} >= target {target_size}"
+            self.logger.info(f"{ticker}: {result['skip_reason']}")
+            return result
+        
         # Compute risk score for this market (uses cached percentiles automatically)
         risk_score = self.compute_risk_score(
             ticker,
@@ -3568,15 +4289,61 @@ class LIPBot:
         )
         result['risk_score'] = risk_score
         
-        # Apply hard risk filter
-        if risk_score > risk_threshold:
-            result['skip_reason'] = f"Risk score {risk_score:.2f} exceeds threshold {risk_threshold}"
-            self.logger.info(f"{ticker}: {result['skip_reason']}")
+        # Get tunable risk thresholds from environment
+        medium_risk_threshold = float(os.getenv("LIP_MEDIUM_RISK_THRESHOLD", "1.5"))
+        high_risk_threshold = float(os.getenv("LIP_HIGH_RISK_THRESHOLD", "2.5"))
+        
+        # Categorize risk and log
+        if risk_score < medium_risk_threshold:
+            risk_category = "LOW"
+            action = "sit at touch"
+        elif risk_score < high_risk_threshold:
+            risk_category = "MEDIUM"
+            action = "sit 1 tick behind"
+        else:
+            risk_category = "HIGH"
+            action = "SKIP"
+        
+        self.logger.info(f"{ticker}: Risk score = {risk_score:.3f} [{risk_category}] → {action}")
+        
+        # Apply hard risk filter - skip high risk markets
+        if risk_score >= high_risk_threshold:
+            result['skip_reason'] = f"Risk score {risk_score:.2f} exceeds high threshold {high_risk_threshold}"
             return result
         
-        # Build qualifying bands for each side
-        bid_band = self.build_qualifying_band(yes_bids, target_size, is_bid_side=True, discount_factor=discount_factor)
-        ask_band = self.build_qualifying_band(yes_asks, target_size, is_bid_side=False, discount_factor=discount_factor)
+        # Generate potential quote levels relative to BBO (not from existing orders)
+        # NEVER improve the touch - only join or sit behind
+        # For bids: BBO (join), BBO-1¢, BBO-2¢, etc.
+        # For asks: BBO (join), BBO+1¢, BBO+2¢, etc.
+        tick_size = 0.01
+        max_levels = 10  # Generate up to 10 levels away from BBO
+        
+        bid_levels = []
+        # For bids: ticks_from_best=0 is join (BBO), 1+ is passive (BBO-1¢, BBO-2¢, ...)
+        for ticks in range(0, max_levels):
+            price = to_tick(bbo_bid - ticks * tick_size)
+            if 0.01 <= price <= 0.99:  # Must be valid price
+                bid_levels.append({
+                    'price': price,
+                    'size': target_size,  # Default to target size
+                    'ticks_from_best': ticks,
+                    'multiplier': discount_factor ** ticks
+                })
+        
+        ask_levels = []
+        # For asks: ticks_from_best=0 is join (BBO), 1+ is passive (BBO+1¢, BBO+2¢, ...)
+        for ticks in range(0, max_levels):
+            price = to_tick(bbo_ask + ticks * tick_size)
+            if 0.01 <= price <= 0.99:  # Must be valid price
+                ask_levels.append({
+                    'price': price,
+                    'size': target_size,  # Default to target size
+                    'ticks_from_best': ticks,
+                    'multiplier': discount_factor ** ticks
+                })
+        
+        bid_band = bid_levels if bid_levels else None
+        ask_band = ask_levels if ask_levels else None
         
         # Compute LIP intensity for each side
         if bid_band:
@@ -3610,6 +4377,13 @@ class LIPBot:
                 # Size should be min of level size and our capacity
                 remaining_capacity = max(0, self.max_position - abs(inventory))
                 result['bid_size'] = min(bid_level['size'], remaining_capacity)
+                
+                # Log quote placement relative to BBO
+                ticks = bid_level['ticks_from_best']
+                if ticks == 0:
+                    self.logger.info(f"{ticker}: BID {bid_level['price']:.2f} JOINS touch (BBO={bbo_bid:.2f})")
+                else:
+                    self.logger.info(f"{ticker}: BID {bid_level['price']:.2f} passive (BBO={bbo_bid:.2f}, {ticks} tick(s) behind)")
         
         if ask_band and inventory > 0:
             # Only quote asks if we have inventory to exit
@@ -3625,6 +4399,13 @@ class LIPBot:
                 result['ask_price'] = ask_level['price']
                 # Size capped by current inventory
                 result['ask_size'] = min(ask_level['size'], inventory)
+                
+                # Log quote placement relative to BBO
+                ticks = ask_level['ticks_from_best']
+                if ticks == 0:
+                    self.logger.info(f"{ticker}: ASK {ask_level['price']:.2f} JOINS touch (BBO={bbo_ask:.2f})")
+                else:
+                    self.logger.info(f"{ticker}: ASK {ask_level['price']:.2f} passive (BBO={bbo_ask:.2f}, {ticks} tick(s) behind)")
         
         return result
 
@@ -3715,7 +4496,6 @@ class LIPBot:
             prices = self.api.get_price(ticker)
             yes_mid = prices.get("yes")
             
-            self.logger.info(f"Yes mid price: {yes_mid}")
             
             if yes_mid is not None:
                 if yes_mid >= EDGE_HIGH:
@@ -3749,9 +4529,6 @@ class LIPBot:
         cashout_action = None
         cashout_price = None
 
-        self.logger.info(f"Checking if market is resolved: {ticker}, {side}, {mkt_bid}, {mkt_ask}, {inventory}")
-        self.logger.info(f"Resolved check result: is_resolved={is_resolved}, resolved_side={resolved_side}")
-        
         if is_resolved and resolved_side:
             # Market is resolved to a specific side
             if resolved_side == "yes":
@@ -3775,8 +4552,6 @@ class LIPBot:
                     cashout_action = "sell"
                     cashout_price = mkt_bid
 
-        self.logger.info(f"Is resolved: {is_resolved}, Resolved side: {resolved_side}, Cashout action: {cashout_action}, Cashout price: {cashout_price}")
-        
         # If resolved with conflicting signals, skip trading but don't cashout
         if is_resolved and resolved_side is None:
             self.logger.info(f"⚠️  CONFLICTING SIGNALS for {ticker} - treating as resolved, skipping trading")
@@ -3836,6 +4611,100 @@ class LIPBot:
                 return True  # Still return True to skip normal order management
         
         return False  # Not a resolved market or no position to cash out
+
+    def _handle_orderbook_update(self, ticker: str, best_bid: float, best_ask: float):
+        """
+        Callback triggered by WebSocketOrderbookTracker when orderbook changes.
+        Reactively adjusts sell orders when inventory > 0.
+        """
+        try:
+            # Only process if we have inventory
+            inventory = self.api.get_position(ticker)
+            if inventory <= 0:
+                return
+            
+            # Get current orders for this ticker
+            current_orders = self.api.get_orders(ticker) or []
+            sell_orders = [o for o in current_orders if o.get("side") == "yes" and o.get("action") == "sell"]
+            
+            # Calculate spread
+            spread = max(0.0, best_ask - best_bid)
+            
+            # Calculate desired ask price using same logic as compute_quotes (lines 3666-3673)
+            # touch_ask is where we can sell (best_bid in the orderbook)
+            touch_ask = best_bid
+            
+            if spread > 0.07:
+                desired_ask = to_tick(touch_ask - 0.02)  # Step in 2 ticks for very wide spreads
+            elif spread > 0.03:
+                desired_ask = to_tick(touch_ask - 0.01)  # Step in 1 tick for wide spreads
+            else:
+                desired_ask = touch_ask  # Use touch for faster exit
+            
+            # Ensure valid price range
+            desired_ask = to_tick(max(0.01, min(0.99, desired_ask)))
+            
+            # Check if we need to update
+            needs_update = False
+            
+            if not sell_orders:
+                # No sell order exists, place one
+                needs_update = True
+                current_ask_price = None
+            else:
+                # Check if current sell order price differs from desired
+                current_sell_order = sell_orders[0]
+                current_ask_raw = current_sell_order.get("yes_price")
+                current_ask_price = to_tick(float(current_ask_raw) / 100.0 if current_ask_raw > 1.0 else float(current_ask_raw))
+                
+                if abs(current_ask_price - desired_ask) > 0.001:  # More than a tiny difference
+                    needs_update = True
+            
+            if needs_update:
+                self.logger.info(
+                    f"[WS_ORDERBOOK] {ticker}: Updating sell order from {current_ask_price} to {desired_ask} "
+                    f"(spread={spread:.3f}, touch_bid={best_bid:.3f}, inventory={inventory})"
+                )
+                
+                # Cancel existing sell orders
+                for order in sell_orders:
+                    try:
+                        self.api.cancel_order(order["order_id"])
+                        self.logger.info(f"[WS_ORDERBOOK] Cancelled sell order {order['order_id']} @ {current_ask_price}")
+                    except Exception as e:
+                        self.logger.warning(f"[WS_ORDERBOOK] Failed to cancel sell order {order['order_id']}: {e}")
+                
+                # Place new sell order
+                try:
+                    sell_size = inventory
+                    order_id = self.api.place_order(
+                        ticker=ticker,
+                        side="yes",
+                        action="sell",
+                        count=sell_size,
+                        yes_price=to_cents(desired_ask)
+                    )
+                    self.logger.info(
+                        f"[WS_ORDERBOOK] Placed sell order {order_id} @ {desired_ask:.3f} "
+                        f"for {sell_size} contracts"
+                    )
+                    
+                    # Record action in metrics if available
+                    if self.metrics:
+                        self.metrics.record_order_action(
+                            ticker=ticker,
+                            side="yes",
+                            action="sell",
+                            price=desired_ask,
+                            size=sell_size,
+                            reason="ws_orderbook_update"
+                        )
+                except Exception as e:
+                    self.logger.error(f"[WS_ORDERBOOK] Failed to place sell order for {ticker}: {e}")
+                    self.metrics.record_api_error("place_order", str(e), ticker)
+                    
+        except Exception as e:
+            self.logger.error(f"[WS_ORDERBOOK] Error handling orderbook update for {ticker}: {e}")
 
     def manage_orders(self, bid: float, ask: float, spread: float, ticker: str, inventory: int, side: str, allow_bid: bool = True, allow_ask: bool = True):
         # does it ever exit markets?
@@ -3996,8 +4865,7 @@ class LIPBot:
                 self.circuit_breaker.record_error("place_order", str(e))
 
         # Place sell only if you want to unload inventory (optional for LIP)
-        self.logger.info(f"Ticker: {ticker}, Side: {side}, Inventory: {inventory}, keep_sell: {keep_sell}, sell_size: {sell_size}")
-        if inventory > 0 and not keep_sell:
+        if inventory > 0 and not keep_sell and allow_ask:
             try:
                 if self.metrics:
                     self.metrics.record_order_sent(ticker, side, "sell", ask, sell_size)

@@ -9,6 +9,9 @@ market_maker:
   min_quote_width_cents: 0         # optional spread floor in cents (0 keeps current behavior)
   inventory_buy_threshold: 0.75    # stop placing buy orders when inventory > 75% of max_position (balances liquidity rewards with risk)
   max_workers: 5                   # number of parallel threads for processing markets (default: 5)
+  max_markets_with_orders: 20      # limit number of markets with active buy orders
+  discovery_interval_seconds: 10   # how often background thread discovers new markets (seconds)
+  orderbook_update_cooldown_ms: 500 # minimum time between orderbook-driven sell order updates per market (milliseconds)
   my_positions:                   # List of tickers that are personal positions (not managed by bot)
      - KXSPOTIFYALBUMRELEASE-25-DRA
      - KXNBAMVP-26-SGIL
